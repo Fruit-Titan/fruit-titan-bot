@@ -1,11 +1,12 @@
 {
   "name": "fruit-titan-bot",
   "version": "1.0.0",
+  "description": "ROL Mining Telegram Bot",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "telegraf": "^4.16.3"
+    "node-telegram-bot-api": "^0.66.0"
   }
 }
