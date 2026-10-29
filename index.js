@@ -1,24 +1,29 @@
-const { Telegraf, Markup } = require('telegraf');
+const TelegramBot = require('node-telegram-bot-api');
 
-// جلب التوكن ورابط الواجهة من المتغيرات البيئية لحمايتها
-const token = process.env.BOT_TOKEN;
-const webAppUrl = process.env.WEB_APP_URL;
+// توكن بوت ROL الجديد
+const token = process.env.BOT_TOKEN || '9185746835:AAGyuUcuaueGvdX30zSXmhddWORdSSHfHZM';
+const bot = new TelegramBot(token, { polling: true });
 
-const bot = new Telegraf(token);
+// رابط تطبيق الويب على Render
+const WEB_APP_URL = 'https://fruit-titan-app.onrender.com';
 
-bot.start((ctx) => {
-  ctx.reply(
-    'أهلاً بك في Fruit Titan! 🚢🍎\nاضغط على الزر أدناه لبدء الاستثمار وتصفح الخطط:',
-    Markup.inlineKeyboard([
-      Markup.button.webApp('فتح التطبيق 🚀', webAppUrl)
-    ])
-  );
+bot.onText(/\/start/, (msg) => {
+  const chatId = msg.chat.id;
+  const firstName = msg.from.first_name || 'صديقي';
+
+  bot.sendMessage(chatId, `مرحباً بك يا ${firstName} في بوت تعدين عملة **ROL** الرسمي!\n\nاضغط على الزر بالأسفل لفتح التطبيق والبدء في جمع العملات مباشرة:`, {
+    parse_mode: 'Markdown',
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: '🚀 ابدأ تعدين ROL الآن', web_app: { url: WEB_APP_URL } }
+        ],
+        [
+          { text: '📢 قناة التحديثات', url: 'https://t.me/telegram' }
+        ]
+      ]
+    }
+  });
 });
 
-bot.launch().then(() => {
-  console.log('البوت يعمل بنجاح الآن...');
-});
-
-// إيقاف آمن للسيرفر في حال إعادة التشغيل
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
+console.log('ROL Mining Bot is running successfully...');
