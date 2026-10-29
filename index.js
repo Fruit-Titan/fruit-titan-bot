@@ -1,6 +1,7 @@
 const TelegramBot = require('node-telegram-bot-api');
+const http = require('http');
 
-// توكن بوت ROL الجديد
+// توكن بوت ROL
 const token = process.env.BOT_TOKEN || '9185746835:AAGyuUcuaueGvdX30zSXmhddWORdSSHfHZM';
 const bot = new TelegramBot(token, { polling: true });
 
@@ -26,4 +27,14 @@ bot.onText(/\/start/, (msg) => {
   });
 });
 
-console.log('ROL Mining Bot is running successfully...');
+// إنشاء خادم HTTP بسيط للاستماع للمنفذ ومنع Render من إيقاف الخدمة
+const PORT = process.env.PORT || 3000;
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+  res.end('ROL Mining Bot is active and running.');
+});
+
+server.listen(PORT, () => {
+  console.log(`Server listening on port ${PORT}`);
+  console.log('ROL Mining Bot is running successfully...');
+});
