@@ -1,31 +1,25 @@
 const TelegramBot = require('node-telegram-bot-api');
 const http = require('http');
 
-// التوكن الجديد المباشر
 const token = '9185746835:AAGvEhljsO4swspCFq0jssQezACLXdTsqIU';
 const bot = new TelegramBot(token, { polling: true });
 
-// معرف الآدمن الخاص بك
 const ADMIN_ID = 1932161126;
 
-// قاعدة بيانات مصغرة في الذاكرة
 let bannedUsers = new Set();
-let pendingWithdrawals = [
-  { id: 'req_1', userId: 88471209, amount: 120 },
-  { id: 'req_2', userId: 99401822, amount: 50 }
-];
-let totalUsersCount = 1482;
+let pendingWithdrawals = [];
+let totalUsersCount = 1;
 let waitingForBanInput = false;
 let waitingForUnbanInput = false;
 
-const WEB_APP_URL = 'https://fruit-titan.github.io/fruit-titan-app/';
+// رابط التطبيق مع إضافة معلمة الإصدار لإجبار المتصفح على التحديث
+let appVersion = Date.now();
+const BASE_APP_URL = 'https://fruit-titan.github.io/fruit-titan-app/';
 
-// معالجة الأخطاء حتى لا يتوقف السيرفر
 bot.on('polling_error', (error) => {
   console.log('Polling status:', error.message);
 });
 
-// استقبال أمر البداية /start
 bot.onText(/\/start/, (msg) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
@@ -35,9 +29,11 @@ bot.onText(/\/start/, (msg) => {
     return bot.sendMessage(chatId, '🚫 عذراً، لقد تم حظر حسابك من استخدام هذا البوت.');
   }
 
+  const webAppUrlWithVersion = `${BASE_APP_URL}?v=${appVersion}`;
+
   let welcomeText = `مرحباً بك يا ${firstName} في تطبيق تعدين ROL الرسمي!\n\nاضغط على الزر بالأسفل لفتح الواجهة وبدء التعدين:`;
   let keyboard = [
-    [{ text: '🚀 ابدأ تعدين ROL الآن', web_app: { url: WEB_APP_URL } }]
+    [{ text: '🚀 ابدأ تعدين ROL الآن', web_app: { url: webAppUrlWithVersion } }]
   ];
 
   if (userId === ADMIN_ID) {
@@ -50,7 +46,6 @@ bot.onText(/\/start/, (msg) => {
   });
 });
 
-// أمر مخصص للآدمن
 bot.onText(/\/admin/, (msg) => {
   if (msg.from.id !== ADMIN_ID) {
     return bot.sendMessage(msg.chat.id, '⛔ هذا الأمر مخصص لمالك البوت فقط.');
@@ -58,13 +53,12 @@ bot.onText(/\/admin/, (msg) => {
   sendAdminPanel(msg.chat.id);
 });
 
-// دالة لوحة تحكم المشرف
 function sendAdminPanel(chatId, messageId = null) {
   const text = `👑 *لوحة تحكم المشرف العليا (ROL Admin)*\n\n` +
                `👥 إجمالي المستخدمين: *${totalUsersCount}*\n` +
                `🚫 عدد المحظورين: *${bannedUsers.size}*\n` +
                `📥 طلبات السحب المعلقة: *${pendingWithdrawals.length}*\n\n` +
-               `اختر الإجراء المطلوب من الأزرار أدناه:`;
+               `اختر الإجراء المطلوب:`;
 
   const inline_keyboard = [
     [
@@ -74,6 +68,9 @@ function sendAdminPanel(chatId, messageId = null) {
     [
       { text: '🚫 حظر مستخدم', callback_data: 'admin_ban' },
       { text: '✅ إلغاء حظر', callback_data: 'admin_unban' }
+    ],
+    [
+      { text: '⚠️ تصفير جميع الأرصدة (Reset)', callback_data: 'admin_confirm_reset' }
     ],
     [
       { text: '🔄 تحديث الإحصائيات', callback_data: 'admin_panel' }
@@ -95,7 +92,6 @@ function sendAdminPanel(chatId, messageId = null) {
   }
 }
 
-// معالجة ضغطات الأزرار (Callback Queries)
 bot.on('callback_query', (query) => {
   const chatId = query.message.chat.id;
   const messageId = query.message.message_id;
@@ -109,7 +105,33 @@ bot.on('callback_query', (query) => {
   if (data === 'admin_panel') {
     sendAdminPanel(chatId, messageId);
     bot.answerCallbackQuery(query.id);
-  } 
+  }
+  else if (data === 'admin_confirm_reset') {
+    const confirmText = `⚠️ *تحذير خطير: تصفير الأرصدة*\n\n` +
+                        `هل أنت متأكد من رغبتك في تصفير جميع أرصدة وتعدين المستخدمين وإعادتهم إلى الصفر؟`;
+    const buttons = [
+      [
+        { text: '🔥 نعم، صفّر كل الحسابات الآن', callback_data: 'admin_do_reset' }
+      ],
+      [
+        { text: '❌ تراجع', callback_data: 'admin_panel' }
+      ]
+    ];
+    bot.editMessageText(confirmText, {
+      chat_id: chatId,
+      message_id: messageId,
+      parse_mode: 'Markdown',
+      reply_markup: { inline_keyboard: buttons }
+    });
+    bot.answerCallbackQuery(query.id);
+  }
+  else if (data === 'admin_do_reset') {
+    // تحديث رقم الإصدار البرمجي لتنفيذ أمر التصفير عند فتح التطبيق
+    appVersion = Date.now();
+    pendingWithdrawals = [];
+    bot.answerCallbackQuery(query.id, { text: 'تم تصفير النظام بنجاح! 🧹', show_alert: true });
+    sendAdminPanel(chatId, messageId);
+  }
   else if (data === 'admin_withdrawals') {
     if (pendingWithdrawals.length === 0) {
       bot.editMessageText('لا توجد طلبات سحب معلقة حالياً.', {
@@ -169,13 +191,9 @@ bot.on('callback_query', (query) => {
     bot.answerCallbackQuery(query.id);
   }
   else if (data === 'admin_top100') {
-    let topText = `🏆 *قائمة المتصدرين (Top 100):*\n\n` +
-                  `🥇 1- \`${ADMIN_ID}\` (أنت) — 2,500,000 ROL\n` +
-                  `🥈 2- \`78912345\` — 1,200,000 ROL\n` +
-                  `🥉 3- \`45612378\` — 950,000 ROL\n` +
-                  `4- \`89123456\` — 820,000 ROL\n` +
-                  `5- \`12345678\` — 610,000 ROL\n` +
-                  `...\n*(باقي القائمة مسجلة في النظام)*`;
+    let topText = `🏆 *قائمة المتصدرين الحقيقية:*\n\n` +
+                  `🥇 1- \`${ADMIN_ID}\` (أنت) — 0.00 ROL\n` +
+                  `*(تمت إعادة ضبط وتصفير السجلات تمهيداً للإطلاق الرسمي)*`;
 
     bot.editMessageText(topText, {
       chat_id: chatId,
@@ -189,7 +207,6 @@ bot.on('callback_query', (query) => {
   }
 });
 
-// استقبال أرقام الـ ID المدخلة للحظر
 bot.on('message', (msg) => {
   if (msg.from.id !== ADMIN_ID || !msg.text || msg.text.startsWith('/')) return;
 
@@ -209,7 +226,6 @@ bot.on('message', (msg) => {
   }
 });
 
-// خادم HTTP لمنع الإغلاق في Render
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
