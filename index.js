@@ -1,7 +1,8 @@
 const TelegramBot = require('node-telegram-bot-api');
 const http = require('http');
 
-const token = process.env.BOT_TOKEN || '9185746835:AAGyuUcuaueGvdX30zSXmhddWORdSSHfHZM';
+// التوكن الجديد المباشر
+const token = '9185746835:AAGvEhljsO4swspCFq0jssQezACLXdTsqIU';
 const bot = new TelegramBot(token, { polling: true });
 
 // معرف الآدمن الخاص بك
@@ -19,13 +20,17 @@ let waitingForUnbanInput = false;
 
 const WEB_APP_URL = 'https://fruit-titan.github.io/fruit-titan-app/';
 
-// أمر البداية للمستخدمين العاديين وللآدمن
+// معالجة الأخطاء حتى لا يتوقف السيرفر
+bot.on('polling_error', (error) => {
+  console.log('Polling status:', error.message);
+});
+
+// استقبال أمر البداية /start
 bot.onText(/\/start/, (msg) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
   const firstName = msg.from.first_name || 'صديقي';
 
-  // التحقق من الحظر
   if (bannedUsers.has(userId)) {
     return bot.sendMessage(chatId, '🚫 عذراً، لقد تم حظر حسابك من استخدام هذا البوت.');
   }
@@ -35,7 +40,6 @@ bot.onText(/\/start/, (msg) => {
     [{ text: '🚀 ابدأ تعدين ROL الآن', web_app: { url: WEB_APP_URL } }]
   ];
 
-  // إذا كنت أنت المشرف يظهر لك زر فتح لوحة التحكم
   if (userId === ADMIN_ID) {
     keyboard.push([{ text: '👑 لوحة تحكم المشرف (Admin)', callback_data: 'admin_panel' }]);
   }
@@ -46,7 +50,7 @@ bot.onText(/\/start/, (msg) => {
   });
 });
 
-// أمر مخصص لفتح لوحة الأدمن مباشرة
+// أمر مخصص للآدمن
 bot.onText(/\/admin/, (msg) => {
   if (msg.from.id !== ADMIN_ID) {
     return bot.sendMessage(msg.chat.id, '⛔ هذا الأمر مخصص لمالك البوت فقط.');
@@ -54,7 +58,7 @@ bot.onText(/\/admin/, (msg) => {
   sendAdminPanel(msg.chat.id);
 });
 
-// دالة عرض لوحة تحكم المشرف
+// دالة لوحة تحكم المشرف
 function sendAdminPanel(chatId, messageId = null) {
   const text = `👑 *لوحة تحكم المشرف العليا (ROL Admin)*\n\n` +
                `👥 إجمالي المستخدمين: *${totalUsersCount}*\n` +
@@ -91,7 +95,7 @@ function sendAdminPanel(chatId, messageId = null) {
   }
 }
 
-// معالجة الأزرار التفاعلية
+// معالجة ضغطات الأزرار (Callback Queries)
 bot.on('callback_query', (query) => {
   const chatId = query.message.chat.id;
   const messageId = query.message.message_id;
@@ -119,14 +123,14 @@ bot.on('callback_query', (query) => {
     }
 
     const req = pendingWithdrawals[0];
-    const text = `📥 *طلب سحب قيد الانتظار:*\n\n` +
+    const text = `📥 *طلب سحب معلق:*\n\n` +
                  `👤 آيدي المستخدم: \`${req.userId}\`\n` +
                  `💰 الكمية: *${req.amount} ROL*\n\n` +
                  `اختر الإجراء:`;
 
     const buttons = [
       [
-        { text: '✅ موافقة وإرسال', callback_data: `approve_${req.id}` },
+        { text: '✅ موافقة', callback_data: `approve_${req.id}` },
         { text: '❌ رفض ومصادرة', callback_data: `reject_${req.id}` }
       ],
       [{ text: '🔙 رجوع', callback_data: 'admin_panel' }]
@@ -149,19 +153,19 @@ bot.on('callback_query', (query) => {
   else if (data.startsWith('reject_')) {
     const reqId = data.replace('reject_', '');
     pendingWithdrawals = pendingWithdrawals.filter(r => r.id !== reqId);
-    bot.answerCallbackQuery(query.id, { text: 'تم الرفض ومصادرة العملات بدون إرجاع! 🚫', show_alert: true });
+    bot.answerCallbackQuery(query.id, { text: 'تم الرفض ومصادرة العملات نهائياً! 🚫', show_alert: true });
     sendAdminPanel(chatId, messageId);
   }
   else if (data === 'admin_ban') {
     waitingForBanInput = true;
     waitingForUnbanInput = false;
-    bot.sendMessage(chatId, 'أرسل الآن الـ ID الخاص بالمستخدم الذي تريد حظره:');
+    bot.sendMessage(chatId, 'أرسل الآن الـ ID الخاص بالحساب المراد حظره:');
     bot.answerCallbackQuery(query.id);
   }
   else if (data === 'admin_unban') {
     waitingForUnbanInput = true;
     waitingForBanInput = false;
-    bot.sendMessage(chatId, 'أرسل الآن الـ ID الخاص بالمستخدم الذي تريد إلغاء حظره:');
+    bot.sendMessage(chatId, 'أرسل الآن الـ ID الخاص بالحساب المراد فك حظره:');
     bot.answerCallbackQuery(query.id);
   }
   else if (data === 'admin_top100') {
@@ -185,7 +189,7 @@ bot.on('callback_query', (query) => {
   }
 });
 
-// استقبال نصوص الـ ID للحظر وإلغاء الحظر
+// استقبال أرقام الـ ID المدخلة للحظر
 bot.on('message', (msg) => {
   if (msg.from.id !== ADMIN_ID || !msg.text || msg.text.startsWith('/')) return;
 
@@ -200,16 +204,16 @@ bot.on('message', (msg) => {
   } else if (waitingForUnbanInput) {
     bannedUsers.delete(targetId);
     waitingForUnbanInput = false;
-    bot.sendMessage(msg.chat.id, `✅ تم إلغاء حظر المستخدم: \`${targetId}\``, { parse_mode: 'Markdown' });
+    bot.sendMessage(msg.chat.id, `✅ تم فك حظر المستخدم: \`${targetId}\``, { parse_mode: 'Markdown' });
     sendAdminPanel(msg.chat.id);
   }
 });
 
-// خادم لإبقاء البوت متصلاً على Render
+// خادم HTTP لمنع الإغلاق في Render
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-  res.end('ROL Bot with Admin Panel is Active');
+  res.end('ROL Mining Bot is Live and Active.');
 }).listen(PORT, '0.0.0.0', () => {
   console.log(`Server listening on port ${PORT}`);
 });
