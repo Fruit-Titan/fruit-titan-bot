@@ -1,11 +1,13 @@
 const TelegramBot = require('node-telegram-bot-api');
 const http = require('http');
+const url = require('url');
 
 const token = process.env.BOT_TOKEN || '9185746835:AAGvEhljsO4swspCFq0jssQezACLXdTsqIU';
 const bot = new TelegramBot(token, { polling: true });
 
 const ADMIN_ID = 1932161126;
 const BASE_APP_URL = 'https://fruit-titan.github.io/fruit-titan-app/';
+const REQUIRED_CHANNEL_USERNAME = 'ROL_TOKN';
 const GROUP_INVITE_URL = 'https://t.me/ROL_TOKN_GROUP';
 
 let bannedUsers = new Set();
@@ -13,6 +15,19 @@ let pendingWithdrawals = [];
 let adminAwaitingAction = null;
 let appVersion = Date.now();
 let resetVersion = 0;
+
+async function isUserSubscribedToChannel(userId) {
+  try {
+    const cleanId = Number(userId);
+    if (!cleanId || isNaN(cleanId)) return false;
+    const member = await bot.getChatMember(`@${REQUIRED_CHANNEL_USERNAME}`, cleanId);
+    const allowedStatuses = ['creator', 'administrator', 'member'];
+    return Boolean(member && allowedStatuses.includes(member.status));
+  } catch (err) {
+    console.error('Channel membership check error:', err.message);
+    return false;
+  }
+}
 
 async function notifyAdminOfWithdrawal(reqObj) {
   const wId = `${Date.now()}_${Math.floor(Math.random() * 1000)}`;
@@ -297,7 +312,7 @@ bot.on('message', async (msg) => {
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
   if (req.method === 'OPTIONS') {
@@ -306,7 +321,23 @@ http.createServer((req, res) => {
     return;
   }
 
-  if (req.method === 'POST' && req.url === '/api/withdraw') {
+  const parsedUrl = url.parse(req.url, true);
+
+  if (req.method === 'GET' && parsedUrl.pathname === '/api/check-channel') {
+    const targetUserId = parsedUrl.query?.userId || '';
+    isUserSubscribedToChannel(targetUserId)
+      .then((joined) => {
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: true, joined: Boolean(joined) }));
+      })
+      .catch(() => {
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, joined: false }));
+      });
+    return;
+  }
+
+  if (req.method === 'POST' && parsedUrl.pathname === '/api/withdraw') {
     let body = '';
     req.on('data', (chunk) => { body += chunk; });
     req.on('end', async () => {
