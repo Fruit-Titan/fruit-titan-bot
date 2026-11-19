@@ -68,7 +68,7 @@ async function resetAllBalancesInFirebase() {
   const nowMs = Date.now();
   appVersion = nowMs;
 
-  // تسجيل طابع التصفير العام ليُجبر index.html على تصفير الكاش والرصيد والجلسة
+  // تسجيل طابع التصفير العام ليُجبر index.html على تصفير الرصيد والجلسة عند التزامن
   await firebaseRequest('/config/global_reset_at.json', 'PUT', nowMs);
 
   const users = await getAllUsersFromFirebase();
@@ -132,9 +132,9 @@ bot.onText(/\/start(.*)/, async (msg, match) => {
   const webAppUrlWithVersion = `${BASE_APP_URL}?${querySuffix}`;
 
   const welcomeText =
-    `⚡ *مرحباً بك يا ${firstName} في ROL Mining*\n\n` +
+    `⚡ *أهلاً بك يا ${firstName} في ROL Mining*\n\n` +
     `• ابدأ جلسات التعدين (10 ساعات) واجمع عملات *ROL* على شبكة TON.\n` +
-    `• ارفع مستوى *VIP* عبر رصيد ROL داخل محفظتك المربوطة واستفد من المكافآت اليومية وعجلة الحظ.\n` +
+    `• ارفع مستوى *VIP* عبر رصيد ROL داخل محفظتك المربوطة وشارك في المكافآت اليومية وعجلة الحظ.\n` +
     `• وثّق حسابك بـ *0.04 GRAM* لاستمرار التعدين وفتح السحب.\n\n` +
     `اضغط على الزر بالأسفل لفتح الواجهة:`;
 
@@ -152,12 +152,12 @@ bot.onText(/\/start(.*)/, async (msg, match) => {
   });
 });
 
-bot.onText(/\/admin/, (msg) => {
+bot.onText(/\/admin/, async (msg) => {
   if (msg.from.id !== ADMIN_ID) {
     return bot.sendMessage(msg.chat.id, '⛔ هذا الأمر مخصص لمالك البوت فقط.');
   }
   adminAwaitingAction = null;
-  sendAdminPanel(msg.chat.id);
+  await sendAdminPanel(msg.chat.id);
 });
 
 async function sendAdminPanel(chatId, messageId = null) {
