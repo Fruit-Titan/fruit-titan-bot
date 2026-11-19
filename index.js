@@ -1,38 +1,135 @@
 const TelegramBot = require('node-telegram-bot-api');
 const http = require('http');
 
-const token = '9185746835:AAGvEhljsO4swspCFq0jssQezACLXdTsqIU';
+const token = process.env.BOT_TOKEN || '9185746835:AAGvEhljsO4swspCFq0jssQezACLXdTsqIU';
+const FIREBASE_DB_URL = (process.env.FIREBASE_DB_URL || 'https://rol-mining-default-rtdb.firebaseio.com').replace(/\/+$/, '');
 const bot = new TelegramBot(token, { polling: true });
 
 const ADMIN_ID = 1932161126;
 
 let bannedUsers = new Set();
 let pendingWithdrawals = [];
-let totalUsersCount = 1;
+let totalUsersCount = 0;
 let waitingForBanInput = false;
 let waitingForUnbanInput = false;
 
 // رابط التطبيق مع إضافة معلمة الإصدار لإجبار المتصفح على التحديث
 let appVersion = Date.now();
-const BASE_APP_URL = 'https://fruit-titan.github.io/fruit-titan-app/';
+const BASE_APP_URL = process.env.WEBAPP_URL || 'https://fruit-titan.github.io/fruit-titan-app/';
+
+async function dbGet(path) {
+  const url = `${FIREBASE_DB_URL}/${path.replace(/^\/+/, '')}.json`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`GET ${path} failed: ${res.status}`);
+  return await res.json();
+}
+
+async function dbPatch(path, payload) {
+  const url = `${FIREBASE_DB_URL}/${path.replace(/^\/+/, '')}.json`;
+  const res = await fetch(url, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+  if (!res.ok) throw new Error(`PATCH ${path} failed: ${res.status}`);
+  return await res.json();
+}
+
+async function syncStatsFromFirebase() {
+  try {
+    const [usersData, withdrawalsData] = await Promise.all([
+      dbGet('users'),
+      dbGet('withdrawals')
+    ]);
+
+    const usersObj = usersData && typeof usersData === 'object' ? usersData : {};
+    const withdrawalsObj = withdrawalsData && typeof withdrawalsData === 'object' ? withdrawalsData : {};
+
+    totalUsersCount = Object.keys(usersObj).length;
+    bannedUsers = new Set(
+      Object.entries(usersObj)
+        .filter(([, u]) => u && u.banned)
+        .map(([uid]) => Number(uid))
+        .filter((n) => !Number.isNaN(n))
+    );
+
+    pendingWithdrawals = Object.entries(withdrawalsObj)
+      .filter(([, w]) => w && w.status === 'pending')
+      .map(([id, w]) => ({ id, ...w }));
+  } catch (err) {
+    console.log('Stats sync warning:', err.message);
+  }
+}
+
+async function resetAllBalancesInFirebase() {
+  const usersData = await dbGet('users');
+  if (!usersData || typeof usersData !== 'object') {
+    return { resetCount: 0, errorCount: 0 };
+  }
+
+  let resetCount = 0;
+  let errorCount = 0;
+
+  for (const [uidKey, uVal] of Object.entries(usersData)) {
+    if (!uVal || typeof uVal !== 'object') continue;
+    try {
+      await dbPatch(`users/${uidKey}`, {
+        balance: 0,
+        startTime: 0,
+        resetAt: Date.now()
+      });
+      resetCount++;
+    } catch (err) {
+      console.log(`Reset error for ${uidKey}:`, err.message);
+      errorCount++;
+    }
+  }
+
+  return { resetCount, errorCount };
+}
 
 bot.on('polling_error', (error) => {
   console.log('Polling status:', error.message);
 });
 
-bot.onText(/\/start/, (msg) => {
+bot.onText(/\/start/, async (msg) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
   const firstName = msg.from.first_name || 'صديقي';
+
+  await syncStatsFromFirebase();
 
   if (bannedUsers.has(userId)) {
     return bot.sendMessage(chatId, '🚫 عذراً، لقد تم حظر حسابك من استخدام هذا البوت.');
   }
 
+  try {
+    const existing = await dbGet(`users/${userId}`);
+    if (!existing || typeof existing !== 'object') {
+      await dbPatch(`users/${userId}`, {
+        uid: String(userId),
+        username: msg.from.username || '',
+        firstName,
+        balance: 0,
+        vip: 1,
+        banned: false,
+        createdAt: Date.now(),
+        updatedAt: Date.now()
+      });
+    } else {
+      await dbPatch(`users/${userId}`, {
+        username: msg.from.username || existing.username || '',
+        updatedAt: Date.now()
+      });
+    }
+  } catch (err) {
+    console.log('User start sync error:', err.message);
+  }
+
   const webAppUrlWithVersion = `${BASE_APP_URL}?v=${appVersion}`;
 
-  let welcomeText = `مرحباً بك يا ${firstName} في تطبيق تعدين ROL الرسمي!\n\nاضغط على الزر بالأسفل لفتح الواجهة وبدء التعدين:`;
-  let keyboard = [
+  const welcomeText = `مرحباً بك يا ${firstName} في تطبيق تعدين ROL الرسمي!\n\nاضغط على الزر بالأسفل لفتح الواجهة وبدء التعدين:`;
+  const keyboard = [
     [{ text: '🚀 ابدأ تعدين ROL الآن', web_app: { url: webAppUrlWithVersion } }]
   ];
 
@@ -53,7 +150,9 @@ bot.onText(/\/admin/, (msg) => {
   sendAdminPanel(msg.chat.id);
 });
 
-function sendAdminPanel(chatId, messageId = null) {
+async function sendAdminPanel(chatId, messageId = null) {
+  await syncStatsFromFirebase();
+
   const text = `👑 *لوحة تحكم المشرف العليا (ROL Admin)*\n\n` +
                `👥 إجمالي المستخدمين: *${totalUsersCount}*\n` +
                `🚫 عدد المحظورين: *${bannedUsers.size}*\n` +
@@ -83,7 +182,7 @@ function sendAdminPanel(chatId, messageId = null) {
       message_id: messageId,
       parse_mode: 'Markdown',
       reply_markup: { inline_keyboard }
-    });
+    }).catch(() => {});
   } else {
     bot.sendMessage(chatId, text, {
       parse_mode: 'Markdown',
@@ -92,7 +191,7 @@ function sendAdminPanel(chatId, messageId = null) {
   }
 }
 
-bot.on('callback_query', (query) => {
+bot.on('callback_query', async (query) => {
   const chatId = query.message.chat.id;
   const messageId = query.message.message_id;
   const data = query.data;
@@ -103,7 +202,7 @@ bot.on('callback_query', (query) => {
   }
 
   if (data === 'admin_panel') {
-    sendAdminPanel(chatId, messageId);
+    await sendAdminPanel(chatId, messageId);
     bot.answerCallbackQuery(query.id);
   }
   else if (data === 'admin_confirm_reset') {
@@ -122,17 +221,31 @@ bot.on('callback_query', (query) => {
       message_id: messageId,
       parse_mode: 'Markdown',
       reply_markup: { inline_keyboard: buttons }
-    });
+    }).catch(() => {});
     bot.answerCallbackQuery(query.id);
   }
   else if (data === 'admin_do_reset') {
-    // تحديث رقم الإصدار البرمجي لتنفيذ أمر التصفير عند فتح التطبيق
-    appVersion = Date.now();
-    pendingWithdrawals = [];
-    bot.answerCallbackQuery(query.id, { text: 'تم تصفير النظام بنجاح! 🧹', show_alert: true });
-    sendAdminPanel(chatId, messageId);
+    try {
+      const { resetCount, errorCount } = await resetAllBalancesInFirebase();
+      appVersion = Date.now();
+      pendingWithdrawals = [];
+      bot.answerCallbackQuery(query.id, {
+        text: `تم تصفير ${resetCount} حساب بنجاح! 🧹`,
+        show_alert: true
+      });
+      await sendAdminPanel(chatId, messageId);
+      if (errorCount > 0) {
+        bot.sendMessage(chatId, `⚠️ تعذر تصفير ${errorCount} حساب، راجع سجلات الخادم.`);
+      }
+    } catch (err) {
+      bot.answerCallbackQuery(query.id, {
+        text: `فشل التصفير: ${err.message}`,
+        show_alert: true
+      });
+    }
   }
   else if (data === 'admin_withdrawals') {
+    await syncStatsFromFirebase();
     if (pendingWithdrawals.length === 0) {
       bot.editMessageText('لا توجد طلبات سحب معلقة حالياً.', {
         chat_id: chatId,
@@ -140,14 +253,16 @@ bot.on('callback_query', (query) => {
         reply_markup: {
           inline_keyboard: [[{ text: '🔙 رجوع للوحة التحكم', callback_data: 'admin_panel' }]]
         }
-      });
-      return;
+      }).catch(() => {});
+      return bot.answerCallbackQuery(query.id);
     }
 
     const req = pendingWithdrawals[0];
+    const reqUid = req.uid || req.userId || '-';
     const text = `📥 *طلب سحب معلق:*\n\n` +
-                 `👤 آيدي المستخدم: \`${req.userId}\`\n` +
-                 `💰 الكمية: *${req.amount} ROL*\n\n` +
+                 `👤 آيدي المستخدم: \`${reqUid}\`\n` +
+                 `💰 الكمية: *${req.amount || 0} ROL*\n` +
+                 `🏦 المحفظة: \`${req.address || '-'}\`\n\n` +
                  `اختر الإجراء:`;
 
     const buttons = [
@@ -163,20 +278,26 @@ bot.on('callback_query', (query) => {
       message_id: messageId,
       parse_mode: 'Markdown',
       reply_markup: { inline_keyboard: buttons }
-    });
+    }).catch(() => {});
     bot.answerCallbackQuery(query.id);
   }
   else if (data.startsWith('approve_')) {
     const reqId = data.replace('approve_', '');
+    try {
+      await dbPatch(`withdrawals/${reqId}`, { status: 'approved', reviewedAt: Date.now() });
+    } catch (err) {}
     pendingWithdrawals = pendingWithdrawals.filter(r => r.id !== reqId);
     bot.answerCallbackQuery(query.id, { text: 'تمت الموافقة بنجاح! ✅', show_alert: true });
-    sendAdminPanel(chatId, messageId);
+    await sendAdminPanel(chatId, messageId);
   }
   else if (data.startsWith('reject_')) {
     const reqId = data.replace('reject_', '');
+    try {
+      await dbPatch(`withdrawals/${reqId}`, { status: 'rejected', reviewedAt: Date.now() });
+    } catch (err) {}
     pendingWithdrawals = pendingWithdrawals.filter(r => r.id !== reqId);
     bot.answerCallbackQuery(query.id, { text: 'تم الرفض ومصادرة العملات نهائياً! 🚫', show_alert: true });
-    sendAdminPanel(chatId, messageId);
+    await sendAdminPanel(chatId, messageId);
   }
   else if (data === 'admin_ban') {
     waitingForBanInput = true;
@@ -191,9 +312,31 @@ bot.on('callback_query', (query) => {
     bot.answerCallbackQuery(query.id);
   }
   else if (data === 'admin_top100') {
-    let topText = `🏆 *قائمة المتصدرين الحقيقية:*\n\n` +
-                  `🥇 1- \`${ADMIN_ID}\` (أنت) — 0.00 ROL\n` +
-                  `*(تمت إعادة ضبط وتصفير السجلات تمهيداً للإطلاق الرسمي)*`;
+    let topText = `🏆 *قائمة المتصدرين الحقيقية:*\n\n`;
+    try {
+      const usersData = await dbGet('users');
+      const list = Object.entries(usersData && typeof usersData === 'object' ? usersData : {})
+        .filter(([, u]) => u && typeof u === 'object')
+        .map(([uId, u]) => ({
+          uid: uId,
+          username: u.username || '',
+          balance: Number(u.balance || 0)
+        }))
+        .sort((a, b) => b.balance - a.balance)
+        .slice(0, 100);
+
+      if (list.length === 0) {
+        topText += `لا توجد حسابات مسجلة حالياً.`;
+      } else {
+        list.forEach((item, idx) => {
+          const medal = idx === 0 ? '🥇' : idx === 1 ? '🥈' : idx === 2 ? '🥉' : `${idx + 1}.`;
+          const nameLabel = item.username ? `@${item.username}` : `\`${item.uid}\``;
+          topText += `${medal} ${nameLabel} — *${item.balance}* ROL\n`;
+        });
+      }
+    } catch (err) {
+      topText += `تعذر جلب القائمة حالياً.`;
+    }
 
     bot.editMessageText(topText, {
       chat_id: chatId,
@@ -202,27 +345,33 @@ bot.on('callback_query', (query) => {
       reply_markup: {
         inline_keyboard: [[{ text: '🔙 رجوع للوحة التحكم', callback_data: 'admin_panel' }]]
       }
-    });
+    }).catch(() => {});
     bot.answerCallbackQuery(query.id);
   }
 });
 
-bot.on('message', (msg) => {
+bot.on('message', async (msg) => {
   if (msg.from.id !== ADMIN_ID || !msg.text || msg.text.startsWith('/')) return;
 
-  const targetId = parseInt(msg.text.trim());
+  const targetId = parseInt(msg.text.trim(), 10);
   if (isNaN(targetId)) return;
 
   if (waitingForBanInput) {
     bannedUsers.add(targetId);
     waitingForBanInput = false;
+    try {
+      await dbPatch(`users/${targetId}`, { banned: true, bannedAt: Date.now() });
+    } catch (err) {}
     bot.sendMessage(msg.chat.id, `✅ تم حظر المستخدم بنجاح: \`${targetId}\``, { parse_mode: 'Markdown' });
-    sendAdminPanel(msg.chat.id);
+    await sendAdminPanel(msg.chat.id);
   } else if (waitingForUnbanInput) {
     bannedUsers.delete(targetId);
     waitingForUnbanInput = false;
+    try {
+      await dbPatch(`users/${targetId}`, { banned: false, banReason: '' });
+    } catch (err) {}
     bot.sendMessage(msg.chat.id, `✅ تم فك حظر المستخدم: \`${targetId}\``, { parse_mode: 'Markdown' });
-    sendAdminPanel(msg.chat.id);
+    await sendAdminPanel(msg.chat.id);
   }
 });
 
