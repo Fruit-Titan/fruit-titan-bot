@@ -1,5 +1,6 @@
 const TelegramBot = require('node-telegram-bot-api');
 const http = require('http');
+const crypto = require('crypto');
 
 const token = process.env.BOT_TOKEN || '9185746835:AAGvEhljsO4swspCFq0jssQezACLXdTsqIU';
 const bot = new TelegramBot(token, { polling: true });
@@ -9,7 +10,8 @@ const BASE_APP_URL = 'https://fruit-titan.github.io/fruit-titan-app/';
 
 const REQUIRED_CHANNEL_USERNAME = 'ROL_TOKN';
 const REQUIRED_CHANNEL_URL = 'https://t.me/ROL_TOKN';
-const REQUIRED_GROUP_URL = 'https://t.me/ROL_TOKN_GROUP';
+const GROUP_INVITE_URL = 'https://t.me/ROL_TOKN_GROUP';
+const AUTH_SECRET = process.env.AUTH_SECRET || crypto.createHash('sha256').update(token).digest('hex');
 
 let bannedUsers = new Set();
 let pendingWithdrawals = [];
@@ -17,35 +19,45 @@ let adminAwaitingAction = null; // 'ban' | 'unban' | 'broadcast'
 let appVersion = Date.now();
 let resetVersion = 0;
 
+function createJoinProof(userId) {
+  const ts = Math.floor(Date.now() / 1000);
+  const sig = crypto
+    .createHmac('sha256', AUTH_SECRET)
+    .update(`${userId}:${REQUIRED_CHANNEL_USERNAME}:${ts}`)
+    .digest('hex')
+    .slice(0, 16);
+  return `${ts}_${sig}`;
+}
+
 async function isUserSubscribedToChannel(userId) {
   try {
     const member = await bot.getChatMember(`@${REQUIRED_CHANNEL_USERNAME}`, userId);
     const allowedStatuses = ['creator', 'administrator', 'member'];
-    return member && allowedStatuses.includes(member.status);
+    return Boolean(member && allowedStatuses.includes(member.status));
   } catch (err) {
     console.error('Channel membership check error:', err.message);
     return false;
   }
 }
 
-function sendForceJoinScreen(chatId, firstName = 'Miner', startParam = '') {
-  const params = [`v=${appVersion}`];
+function buildVerifiedAppUrl(userId, startParam = '') {
+  const proof = createJoinProof(userId);
+  const params = [`v=${appVersion}`, `ch_ok=1`, `uid=${userId}`, `proof=${proof}`];
   if (resetVersion > 0) params.push(`reset=${resetVersion}`);
   if (startParam) params.push(`startapp=${encodeURIComponent(startParam)}`);
-  const webAppUrl = `${BASE_APP_URL}?${params.join('&')}`;
+  return `${BASE_APP_URL}?${params.join('&')}`;
+}
 
+function sendForceJoinScreen(chatId, firstName = 'Miner', startParam = '') {
   const text =
     `🛡️ *ACCESS LOCKED — MANDATORY CHANNEL JOIN*\n\n` +
-    `Welcome *${firstName}*! To enter *ROL Mining* and protect the official community channel, you must join our main channel first.\n\n` +
-    `✦ *Official Channel:* [@${REQUIRED_CHANNEL_USERNAME}](${REQUIRED_CHANNEL_URL})\n` +
-    `✦ *Note:* If you leave the channel at any time, access will be locked again until you rejoin.\n\n` +
-    `1. Tap *Join Official Channel* below.\n` +
-    `2. Tap *Verify & Enter* once joined.`;
+    `Welcome *${firstName}*! You must join our official channel *@${REQUIRED_CHANNEL_USERNAME}* to unlock *ROL Mining*.\n\n` +
+    `1. Tap *Join Channel (@ROL_TOKN)* below.\n` +
+    `2. Tap *Verify Subscription* after joining.`;
 
   const keyboard = [
-    [{ text: '📢 Join Official Channel (@ROL_TOKN)', url: REQUIRED_CHANNEL_URL }],
-    [{ text: '✅ Verify & Enter', callback_data: `check_join_${encodeURIComponent(startParam || '')}` }],
-    [{ text: '🚀 Launch App', web_app: { url: webAppUrl } }]
+    [{ text: '📢 Join Channel (@ROL_TOKN)', url: REQUIRED_CHANNEL_URL }],
+    [{ text: '✅ Verify Subscription', callback_data: `verify_ch_${encodeURIComponent(startParam || '')}` }]
   ];
 
   return bot.sendMessage(chatId, text, {
@@ -56,10 +68,7 @@ function sendForceJoinScreen(chatId, firstName = 'Miner', startParam = '') {
 }
 
 function sendMainStartMessage(chatId, userId, firstName, startParam = '') {
-  const params = [`v=${appVersion}`];
-  if (resetVersion > 0) params.push(`reset=${resetVersion}`);
-  if (startParam) params.push(`startapp=${encodeURIComponent(startParam)}`);
-  const webAppUrl = `${BASE_APP_URL}?${params.join('&')}`;
+  const webAppUrl = buildVerifiedAppUrl(userId, startParam);
 
   const welcomeText =
     `⚡ *Welcome to ROL Mining, ${firstName}!*\n\n` +
@@ -73,7 +82,7 @@ function sendMainStartMessage(chatId, userId, firstName, startParam = '') {
 
   const keyboard = [
     [{ text: '🚀 Start Mining ROL Now', web_app: { url: webAppUrl } }],
-    [{ text: '💬 Join Community Group', url: REQUIRED_GROUP_URL }]
+    [{ text: '💬 Join Community Group', url: GROUP_INVITE_URL }]
   ];
 
   if (userId === ADMIN_ID) {
@@ -165,19 +174,19 @@ bot.on('callback_query', async (query) => {
   const userId = query.from.id;
   const firstName = query.from.first_name || 'Miner';
 
-  if (data.startsWith('check_join_')) {
-    const encodedParam = data.replace('check_join_', '');
+  if (data.startsWith('verify_ch_')) {
+    const encodedParam = data.replace('verify_ch_', '');
     const startParam = encodedParam ? decodeURIComponent(encodedParam) : '';
     const joined = await isUserSubscribedToChannel(userId);
 
     if (!joined) {
       return bot.answerCallbackQuery(query.id, {
-        text: '⚠️ You have not joined @ROL_TOKN yet. Please join first!',
+        text: '⚠️ You are not a member of @ROL_TOKN yet. Join first, then tap Verify Subscription.',
         show_alert: true
       });
     }
 
-    bot.answerCallbackQuery(query.id, { text: '✅ Subscription verified! Welcome to ROL Mining.' });
+    bot.answerCallbackQuery(query.id, { text: '✅ Subscription verified! Access unlocked.' });
     bot.deleteMessage(chatId, messageId).catch(() => {});
     return sendMainStartMessage(chatId, userId, firstName, startParam);
   }
