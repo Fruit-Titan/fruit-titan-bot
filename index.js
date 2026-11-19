@@ -20,11 +20,11 @@ bot.on('polling_error', (error) => {
 bot.onText(/\/start(.*)/, (msg, match) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
-  const firstName = msg.from.first_name || 'صديقي';
+  const firstName = msg.from.first_name || 'Miner';
   const startParam = match && match[1] ? match[1].trim() : '';
 
   if (bannedUsers.has(userId)) {
-    return bot.sendMessage(chatId, '🚫 عذراً، لقد تم حظر حسابك من استخدام هذا البوت.');
+    return bot.sendMessage(chatId, '🚫 Access denied. Your account has been restricted from using this bot.');
   }
 
   const params = [`v=${appVersion}`];
@@ -33,14 +33,17 @@ bot.onText(/\/start(.*)/, (msg, match) => {
   const webAppUrl = `${BASE_APP_URL}?${params.join('&')}`;
 
   const welcomeText =
-    `⚡ *مرحباً بك يا ${firstName} في ROL Mining*\n\n` +
-    `• ابدأ جلسات التعدين واجمع عملات *ROL* على شبكة TON.\n` +
-    `• ارفع مستوى *VIP* عبر رصيد ROL داخل محفظتك المربوطة واستفد من المكافآت وعجلة الحظ.\n` +
-    `• وثّق حسابك بـ *0.04 GRAM* لاستمرار التعدين وفتح السحب.\n\n` +
-    `اضغط على الزر بالأسفل لفتح الواجهة:`;
+    `⚡ *Welcome to ROL Mining, ${firstName}!*\n\n` +
+    `*ROL* is a community-driven token built on the *TON* blockchain, designed for active miners, holders, and builders shaping a stronger ecosystem together.\n\n` +
+    `✦ *10-Hour Mining Cycles:* Accumulate *ROL* tokens steadily.\n` +
+    `✦ *VIP Tiers (VIP 1 – VIP 100):* Grow your tier and boost daily rewards.\n` +
+    `✦ *Daily Rewards & Fortune Wheel:* Claim streak bonuses and spin for extra *ROL*.\n` +
+    `✦ *Tasks & Referrals:* Complete missions and invite friends to expand the network.\n\n` +
+    `Every miner is an early pioneer — let's build and grow the future of *ROL* together.\n\n` +
+    `Tap the button below to enter the mining terminal:`;
 
   const keyboard = [
-    [{ text: '🚀 ابدأ تعدين ROL الآن', web_app: { url: webAppUrl } }]
+    [{ text: '🚀 Start Mining ROL Now', web_app: { url: webAppUrl } }]
   ];
 
   if (userId === ADMIN_ID) {
@@ -55,7 +58,7 @@ bot.onText(/\/start(.*)/, (msg, match) => {
 
 bot.onText(/\/admin/, (msg) => {
   if (msg.from.id !== ADMIN_ID) {
-    return bot.sendMessage(msg.chat.id, '⛔ هذا الأمر مخصص لمالك البوت فقط.');
+    return bot.sendMessage(msg.chat.id, '⛔ This command is restricted to the bot administrator.');
   }
   adminAwaitingAction = null;
   sendAdminPanel(msg.chat.id);
