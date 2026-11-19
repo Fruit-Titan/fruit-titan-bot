@@ -7,26 +7,55 @@ const bot = new TelegramBot(token, { polling: true });
 const ADMIN_ID = 1932161126;
 const BASE_APP_URL = 'https://fruit-titan.github.io/fruit-titan-app/';
 
+const REQUIRED_CHANNEL_USERNAME = 'ROL_TOKN';
+const REQUIRED_CHANNEL_URL = 'https://t.me/ROL_TOKN';
+const REQUIRED_GROUP_URL = 'https://t.me/ROL_TOKN_GROUP';
+
 let bannedUsers = new Set();
 let pendingWithdrawals = [];
 let adminAwaitingAction = null; // 'ban' | 'unban' | 'broadcast'
 let appVersion = Date.now();
 let resetVersion = 0;
 
-bot.on('polling_error', (error) => {
-  console.log('Polling status:', error.message);
-});
-
-bot.onText(/\/start(.*)/, (msg, match) => {
-  const chatId = msg.chat.id;
-  const userId = msg.from.id;
-  const firstName = msg.from.first_name || 'Miner';
-  const startParam = match && match[1] ? match[1].trim() : '';
-
-  if (bannedUsers.has(userId)) {
-    return bot.sendMessage(chatId, '🚫 Access denied. Your account has been restricted from using this bot.');
+async function isUserSubscribedToChannel(userId) {
+  try {
+    const member = await bot.getChatMember(`@${REQUIRED_CHANNEL_USERNAME}`, userId);
+    const allowedStatuses = ['creator', 'administrator', 'member'];
+    return member && allowedStatuses.includes(member.status);
+  } catch (err) {
+    console.error('Channel membership check error:', err.message);
+    return false;
   }
+}
 
+function sendForceJoinScreen(chatId, firstName = 'Miner', startParam = '') {
+  const params = [`v=${appVersion}`];
+  if (resetVersion > 0) params.push(`reset=${resetVersion}`);
+  if (startParam) params.push(`startapp=${encodeURIComponent(startParam)}`);
+  const webAppUrl = `${BASE_APP_URL}?${params.join('&')}`;
+
+  const text =
+    `🛡️ *ACCESS LOCKED — MANDATORY CHANNEL JOIN*\n\n` +
+    `Welcome *${firstName}*! To enter *ROL Mining* and protect the official community channel, you must join our main channel first.\n\n` +
+    `✦ *Official Channel:* [@${REQUIRED_CHANNEL_USERNAME}](${REQUIRED_CHANNEL_URL})\n` +
+    `✦ *Note:* If you leave the channel at any time, access will be locked again until you rejoin.\n\n` +
+    `1. Tap *Join Official Channel* below.\n` +
+    `2. Tap *Verify & Enter* once joined.`;
+
+  const keyboard = [
+    [{ text: '📢 Join Official Channel (@ROL_TOKN)', url: REQUIRED_CHANNEL_URL }],
+    [{ text: '✅ Verify & Enter', callback_data: `check_join_${encodeURIComponent(startParam || '')}` }],
+    [{ text: '🚀 Launch App', web_app: { url: webAppUrl } }]
+  ];
+
+  return bot.sendMessage(chatId, text, {
+    parse_mode: 'Markdown',
+    disable_web_page_preview: true,
+    reply_markup: { inline_keyboard: keyboard }
+  });
+}
+
+function sendMainStartMessage(chatId, userId, firstName, startParam = '') {
   const params = [`v=${appVersion}`];
   if (resetVersion > 0) params.push(`reset=${resetVersion}`);
   if (startParam) params.push(`startapp=${encodeURIComponent(startParam)}`);
@@ -43,17 +72,40 @@ bot.onText(/\/start(.*)/, (msg, match) => {
     `Tap the button below to enter the mining terminal:`;
 
   const keyboard = [
-    [{ text: '🚀 Start Mining ROL Now', web_app: { url: webAppUrl } }]
+    [{ text: '🚀 Start Mining ROL Now', web_app: { url: webAppUrl } }],
+    [{ text: '💬 Join Community Group', url: REQUIRED_GROUP_URL }]
   ];
 
   if (userId === ADMIN_ID) {
     keyboard.push([{ text: '👑 لوحة تحكم المشرف (Admin)', callback_data: 'admin_panel' }]);
   }
 
-  bot.sendMessage(chatId, welcomeText, {
+  return bot.sendMessage(chatId, welcomeText, {
     parse_mode: 'Markdown',
     reply_markup: { inline_keyboard: keyboard }
   });
+}
+
+bot.on('polling_error', (error) => {
+  console.log('Polling status:', error.message);
+});
+
+bot.onText(/\/start(.*)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
+  const firstName = msg.from.first_name || 'Miner';
+  const startParam = match && match[1] ? match[1].trim() : '';
+
+  if (bannedUsers.has(userId)) {
+    return bot.sendMessage(chatId, '🚫 Access denied. Your account has been restricted from using this bot.');
+  }
+
+  const joined = await isUserSubscribedToChannel(userId);
+  if (!joined) {
+    return sendForceJoinScreen(chatId, firstName, startParam);
+  }
+
+  return sendMainStartMessage(chatId, userId, firstName, startParam);
 });
 
 bot.onText(/\/admin/, (msg) => {
@@ -67,6 +119,7 @@ bot.onText(/\/admin/, (msg) => {
 function sendAdminPanel(chatId, messageId = null) {
   const text =
     `👑 *لوحة تحكم المشرف العليا (ROL Admin)*\n\n` +
+    `📢 قناة الاشتراك الإجباري: *@${REQUIRED_CHANNEL_USERNAME}*\n` +
     `🔄 رقم إصدار التصفير الحالي: *${resetVersion}*\n` +
     `🚫 عدد المحظورين: *${bannedUsers.size}*\n` +
     `📥 طلبات السحب المعلقة: *${pendingWithdrawals.length}*\n\n` +
@@ -105,11 +158,29 @@ function sendAdminPanel(chatId, messageId = null) {
   }
 }
 
-bot.on('callback_query', (query) => {
+bot.on('callback_query', async (query) => {
   const chatId = query.message.chat.id;
   const messageId = query.message.message_id;
   const data = query.data;
   const userId = query.from.id;
+  const firstName = query.from.first_name || 'Miner';
+
+  if (data.startsWith('check_join_')) {
+    const encodedParam = data.replace('check_join_', '');
+    const startParam = encodedParam ? decodeURIComponent(encodedParam) : '';
+    const joined = await isUserSubscribedToChannel(userId);
+
+    if (!joined) {
+      return bot.answerCallbackQuery(query.id, {
+        text: '⚠️ You have not joined @ROL_TOKN yet. Please join first!',
+        show_alert: true
+      });
+    }
+
+    bot.answerCallbackQuery(query.id, { text: '✅ Subscription verified! Welcome to ROL Mining.' });
+    bot.deleteMessage(chatId, messageId).catch(() => {});
+    return sendMainStartMessage(chatId, userId, firstName, startParam);
+  }
 
   if (userId !== ADMIN_ID) {
     return bot.answerCallbackQuery(query.id, { text: 'غير مصرح لك!', show_alert: true });
@@ -217,34 +288,47 @@ bot.on('callback_query', (query) => {
   }
 });
 
-bot.on('message', (msg) => {
-  if (msg.from.id !== ADMIN_ID || !msg.text || msg.text.startsWith('/')) return;
+bot.on('message', async (msg) => {
+  if (!msg.text || msg.text.startsWith('/')) return;
 
-  const action = adminAwaitingAction;
-  if (!action) return;
+  const userId = msg.from.id;
+  const chatId = msg.chat.id;
+  const firstName = msg.from.first_name || 'Miner';
 
-  const rawText = msg.text.trim();
-  adminAwaitingAction = null;
+  if (userId === ADMIN_ID && adminAwaitingAction) {
+    const action = adminAwaitingAction;
+    const rawText = msg.text.trim();
+    adminAwaitingAction = null;
 
-  if (action === 'ban') {
-    const targetId = parseInt(rawText, 10);
-    if (isNaN(targetId)) {
-      return bot.sendMessage(msg.chat.id, '⚠️ يرجى إرسال رقم ID صحيح.');
+    if (action === 'ban') {
+      const targetId = parseInt(rawText, 10);
+      if (isNaN(targetId)) {
+        return bot.sendMessage(chatId, '⚠️ يرجى إرسال رقم ID صحيح.');
+      }
+      bannedUsers.add(targetId);
+      bot.sendMessage(chatId, `✅ تم حظر المستخدم بنجاح: \`${targetId}\``, { parse_mode: 'Markdown' });
+      return sendAdminPanel(chatId);
+    } else if (action === 'unban') {
+      const targetId = parseInt(rawText, 10);
+      if (isNaN(targetId)) {
+        return bot.sendMessage(chatId, '⚠️ يرجى إرسال رقم ID صحيح.');
+      }
+      bannedUsers.delete(targetId);
+      bot.sendMessage(chatId, `✅ تم فك حظر المستخدم: \`${targetId}\``, { parse_mode: 'Markdown' });
+      return sendAdminPanel(chatId);
+    } else if (action === 'broadcast') {
+      bot.sendMessage(chatId, `📢 تم تجهيز الرسالة الجماعية:\n\n${rawText}`);
+      return sendAdminPanel(chatId);
     }
-    bannedUsers.add(targetId);
-    bot.sendMessage(msg.chat.id, `✅ تم حظر المستخدم بنجاح: \`${targetId}\``, { parse_mode: 'Markdown' });
-    sendAdminPanel(msg.chat.id);
-  } else if (action === 'unban') {
-    const targetId = parseInt(rawText, 10);
-    if (isNaN(targetId)) {
-      return bot.sendMessage(msg.chat.id, '⚠️ يرجى إرسال رقم ID صحيح.');
+  }
+
+  if (bannedUsers.has(userId)) return;
+
+  if (msg.chat && msg.chat.type === 'private') {
+    const joined = await isUserSubscribedToChannel(userId);
+    if (!joined) {
+      return sendForceJoinScreen(chatId, firstName);
     }
-    bannedUsers.delete(targetId);
-    bot.sendMessage(msg.chat.id, `✅ تم فك حظر المستخدم: \`${targetId}\``, { parse_mode: 'Markdown' });
-    sendAdminPanel(msg.chat.id);
-  } else if (action === 'broadcast') {
-    bot.sendMessage(msg.chat.id, `📢 تم تجهيز الرسالة الجماعية:\n\n${rawText}`);
-    sendAdminPanel(msg.chat.id);
   }
 });
 
