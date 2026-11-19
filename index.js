@@ -48,6 +48,33 @@ function buildVerifiedAppUrl(userId, startParam = '') {
   return `${BASE_APP_URL}?${params.join('&')}`;
 }
 
+async function notifyAdminOfWithdrawal(reqObj) {
+  const wId = `${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+  const entry = {
+    id: wId,
+    userId: String(reqObj.userId || ''),
+    username: String(reqObj.username || 'No Username'),
+    walletAddress: String(reqObj.walletAddress || ''),
+    amount: Number(reqObj.amount || 0),
+    createdAt: Date.now()
+  };
+  pendingWithdrawals.unshift(entry);
+
+  const adminMsg =
+    `💸 *طلب سحب جديد (ROL Withdrawal)*\n\n` +
+    `👤 المستخدم: *${entry.username}*\n` +
+    `🆔 المعرف: \`${entry.userId}\`\n` +
+    `🏦 عنوان المحفظة: \`${entry.walletAddress}\`\n` +
+    `💰 الكمية: *${entry.amount} ROL*`;
+
+  try {
+    await bot.sendMessage(ADMIN_ID, adminMsg, { parse_mode: 'Markdown' });
+  } catch (e) {
+    console.error('Failed to notify admin of withdrawal:', e.message);
+  }
+  return entry;
+}
+
 function sendForceJoinScreen(chatId, firstName = 'Miner', startParam = '') {
   const text =
     `🛡️ *ACCESS LOCKED — MANDATORY CHANNEL JOIN*\n\n` +
@@ -74,7 +101,7 @@ function sendMainStartMessage(chatId, userId, firstName, startParam = '') {
     `⚡ *Welcome to ROL Mining, ${firstName}!*\n\n` +
     `*ROL* is a community-driven token built on the *TON* blockchain, designed for active miners, holders, and builders shaping a stronger ecosystem together.\n\n` +
     `✦ *10-Hour Mining Cycles:* Accumulate *ROL* tokens steadily.\n` +
-    `✦ *VIP Tiers (VIP 1 – VIP 100):* Grow your tier and boost daily rewards.\n` +
+    `✦ *VIP Tiers (VIP 1 – VIP 100):* Free tier starts at 400 ROL/24h (+60 ROL per tier).\n` +
     `✦ *Daily Rewards & Fortune Wheel:* Claim streak bonuses and spin for extra *ROL*.\n` +
     `✦ *Tasks & Referrals:* Complete missions and invite friends to expand the network.\n\n` +
     `Every miner is an early pioneer — let's build and grow the future of *ROL* together.\n\n` +
@@ -243,7 +270,9 @@ bot.on('callback_query', async (query) => {
     const req = pendingWithdrawals[0];
     const text =
       `📥 *طلب سحب معلق:*\n\n` +
-      `👤 آيدي المستخدم: \`${req.userId}\`\n` +
+      `👤 اليوزر: *${req.username}*\n` +
+      `🆔 المعرف: \`${req.userId}\`\n` +
+      `🏦 العنوان: \`${req.walletAddress}\`\n` +
       `💰 الكمية: *${req.amount} ROL*\n\n` +
       `اختر الإجراء:`;
 
@@ -298,6 +327,21 @@ bot.on('callback_query', async (query) => {
 });
 
 bot.on('message', async (msg) => {
+  if (msg.web_app_data && msg.web_app_data.data) {
+    try {
+      const parsed = JSON.parse(msg.web_app_data.data);
+      if (parsed && parsed.type === 'withdraw_request') {
+        await notifyAdminOfWithdrawal({
+          userId: parsed.userId || msg.from.id,
+          username: msg.from.username ? `@${msg.from.username}` : (parsed.username || 'No Username'),
+          walletAddress: parsed.walletAddress,
+          amount: parsed.amount
+        });
+      }
+    } catch (e) {}
+    return;
+  }
+
   if (!msg.text || msg.text.startsWith('/')) return;
 
   const userId = msg.from.id;
@@ -343,6 +387,33 @@ bot.on('message', async (msg) => {
 
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+
+  if (req.method === 'POST' && req.url === '/api/withdraw') {
+    let body = '';
+    req.on('data', (chunk) => { body += chunk; });
+    req.on('end', async () => {
+      try {
+        const data = JSON.parse(body || '{}');
+        await notifyAdminOfWithdrawal(data);
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: true }));
+      } catch (err) {
+        res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, error: err.message }));
+      }
+    });
+    return;
+  }
+
   res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
   res.end('ROL Mining Bot is Live and Active.');
 }).listen(PORT, '0.0.0.0', () => {
