@@ -1,45 +1,62 @@
 const TelegramBot = require('node-telegram-bot-api');
 const http = require('http');
+const https = require('https');
 
 const token = process.env.BOT_TOKEN || '9185746835:AAGvEhljsO4swspCFq0jssQezACLXdTsqIU';
 const FIREBASE_DB_URL = (process.env.FIREBASE_DB_URL || 'https://rol-mining-default-rtdb.firebaseio.com').replace(/\/+$/, '');
-const bot = new TelegramBot(token, { polling: true });
-
+const BASE_APP_URL = process.env.WEBAPP_URL || 'https://fruit-titan.github.io/fruit-titan-app/';
 const ADMIN_ID = 1932161126;
+
+const bot = new TelegramBot(token, { polling: true });
 
 let bannedUsers = new Set();
 let pendingWithdrawals = [];
 let totalUsersCount = 0;
 let waitingForBanInput = false;
 let waitingForUnbanInput = false;
-
-// رابط التطبيق مع إضافة معلمة الإصدار لإجبار المتصفح على التحديث
 let appVersion = Date.now();
-const BASE_APP_URL = process.env.WEBAPP_URL || 'https://fruit-titan.github.io/fruit-titan-app/';
 
-async function dbGet(path) {
-  const url = `${FIREBASE_DB_URL}/${path.replace(/^\/+/, '')}.json`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`GET ${path} failed: ${res.status}`);
-  return await res.json();
-}
+function firebaseRequest(method, path, bodyObj = null) {
+  return new Promise((resolve, reject) => {
+    const cleanPath = path.replace(/^\/+/, '');
+    const fullUrl = new URL(`${FIREBASE_DB_URL}/${cleanPath}.json`);
+    const payload = bodyObj ? JSON.stringify(bodyObj) : null;
 
-async function dbPatch(path, payload) {
-  const url = `${FIREBASE_DB_URL}/${path.replace(/^\/+/, '')}.json`;
-  const res = await fetch(url, {
-    method: 'PATCH',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload)
+    const req = https.request({
+      hostname: fullUrl.hostname,
+      path: `${fullUrl.pathname}${fullUrl.search}`,
+      method,
+      headers: {
+        'Content-Type': 'application/json',
+        ...(payload ? { 'Content-Length': Buffer.byteLength(payload) } : {})
+      }
+    }, (res) => {
+      let raw = '';
+      res.on('data', chunk => raw += chunk);
+      res.on('end', () => {
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          try {
+            resolve(raw ? JSON.parse(raw) : null);
+          } catch {
+            resolve(null);
+          }
+        } else {
+          reject(new Error(`Firebase ${method} ${res.statusCode}`));
+        }
+      });
+    });
+
+    req.on('error', reject);
+    if (payload) req.write(payload);
+    req.end();
   });
-  if (!res.ok) throw new Error(`PATCH ${path} failed: ${res.status}`);
-  return await res.json();
 }
 
 async function syncStatsFromFirebase() {
   try {
     const [usersData, withdrawalsData] = await Promise.all([
-      dbGet('users'),
-      dbGet('withdrawals')
+      firebaseRequest('GET', 'users').catch(() => ({})),
+      firebaseRequest('GET', 'withdrawals').catch(() => ({}))
     ]);
 
     const usersObj = usersData && typeof usersData === 'object' ? usersData : {};
@@ -50,19 +67,19 @@ async function syncStatsFromFirebase() {
       Object.entries(usersObj)
         .filter(([, u]) => u && u.banned)
         .map(([uid]) => Number(uid))
-        .filter((n) => !Number.isNaN(n))
+        .filter(n => !Number.isNaN(n))
     );
 
     pendingWithdrawals = Object.entries(withdrawalsObj)
       .filter(([, w]) => w && w.status === 'pending')
       .map(([id, w]) => ({ id, ...w }));
-  } catch (err) {
-    console.log('Stats sync warning:', err.message);
+  } catch (e) {
+    console.log('Sync stats error:', e.message);
   }
 }
 
 async function resetAllBalancesInFirebase() {
-  const usersData = await dbGet('users');
+  const usersData = await firebaseRequest('GET', 'users');
   if (!usersData || typeof usersData !== 'object') {
     return { resetCount: 0, errorCount: 0 };
   }
@@ -73,14 +90,14 @@ async function resetAllBalancesInFirebase() {
   for (const [uidKey, uVal] of Object.entries(usersData)) {
     if (!uVal || typeof uVal !== 'object') continue;
     try {
-      await dbPatch(`users/${uidKey}`, {
+      await firebaseRequest('PATCH', `users/${uidKey}`, {
         balance: 0,
         startTime: 0,
         resetAt: Date.now()
       });
       resetCount++;
-    } catch (err) {
-      console.log(`Reset error for ${uidKey}:`, err.message);
+    } catch (e) {
+      console.log(`Reset failed for ${uidKey}:`, e.message);
       errorCount++;
     }
   }
@@ -88,8 +105,8 @@ async function resetAllBalancesInFirebase() {
   return { resetCount, errorCount };
 }
 
-bot.on('polling_error', (error) => {
-  console.log('Polling status:', error.message);
+bot.on('polling_error', (err) => {
+  console.log('Polling error:', err.message);
 });
 
 bot.onText(/\/start/, async (msg) => {
@@ -104,9 +121,9 @@ bot.onText(/\/start/, async (msg) => {
   }
 
   try {
-    const existing = await dbGet(`users/${userId}`);
+    const existing = await firebaseRequest('GET', `users/${userId}`).catch(() => null);
     if (!existing || typeof existing !== 'object') {
-      await dbPatch(`users/${userId}`, {
+      await firebaseRequest('PATCH', `users/${userId}`, {
         uid: String(userId),
         username: msg.from.username || '',
         firstName,
@@ -117,17 +134,16 @@ bot.onText(/\/start/, async (msg) => {
         updatedAt: Date.now()
       });
     } else {
-      await dbPatch(`users/${userId}`, {
+      await firebaseRequest('PATCH', `users/${userId}`, {
         username: msg.from.username || existing.username || '',
         updatedAt: Date.now()
       });
     }
-  } catch (err) {
-    console.log('User start sync error:', err.message);
+  } catch (e) {
+    console.log('User start error:', e.message);
   }
 
   const webAppUrlWithVersion = `${BASE_APP_URL}?v=${appVersion}`;
-
   const welcomeText = `مرحباً بك يا ${firstName} في تطبيق تعدين ROL الرسمي!\n\nاضغط على الزر بالأسفل لفتح الواجهة وبدء التعدين:`;
   const keyboard = [
     [{ text: '🚀 ابدأ تعدين ROL الآن', web_app: { url: webAppUrlWithVersion } }]
@@ -209,12 +225,8 @@ bot.on('callback_query', async (query) => {
     const confirmText = `⚠️ *تحذير خطير: تصفير الأرصدة*\n\n` +
                         `هل أنت متأكد من رغبتك في تصفير جميع أرصدة وتعدين المستخدمين وإعادتهم إلى الصفر؟`;
     const buttons = [
-      [
-        { text: '🔥 نعم، صفّر كل الحسابات الآن', callback_data: 'admin_do_reset' }
-      ],
-      [
-        { text: '❌ تراجع', callback_data: 'admin_panel' }
-      ]
+      [{ text: '🔥 نعم، صفّر كل الحسابات الآن', callback_data: 'admin_do_reset' }],
+      [{ text: '❌ تراجع', callback_data: 'admin_panel' }]
     ];
     bot.editMessageText(confirmText, {
       chat_id: chatId,
@@ -235,7 +247,7 @@ bot.on('callback_query', async (query) => {
       });
       await sendAdminPanel(chatId, messageId);
       if (errorCount > 0) {
-        bot.sendMessage(chatId, `⚠️ تعذر تصفير ${errorCount} حساب، راجع سجلات الخادم.`);
+        bot.sendMessage(chatId, `⚠️ تعذر تصفير ${errorCount} حساب.`);
       }
     } catch (err) {
       bot.answerCallbackQuery(query.id, {
@@ -283,18 +295,14 @@ bot.on('callback_query', async (query) => {
   }
   else if (data.startsWith('approve_')) {
     const reqId = data.replace('approve_', '');
-    try {
-      await dbPatch(`withdrawals/${reqId}`, { status: 'approved', reviewedAt: Date.now() });
-    } catch (err) {}
+    await firebaseRequest('PATCH', `withdrawals/${reqId}`, { status: 'approved', reviewedAt: Date.now() }).catch(() => {});
     pendingWithdrawals = pendingWithdrawals.filter(r => r.id !== reqId);
     bot.answerCallbackQuery(query.id, { text: 'تمت الموافقة بنجاح! ✅', show_alert: true });
     await sendAdminPanel(chatId, messageId);
   }
   else if (data.startsWith('reject_')) {
     const reqId = data.replace('reject_', '');
-    try {
-      await dbPatch(`withdrawals/${reqId}`, { status: 'rejected', reviewedAt: Date.now() });
-    } catch (err) {}
+    await firebaseRequest('PATCH', `withdrawals/${reqId}`, { status: 'rejected', reviewedAt: Date.now() }).catch(() => {});
     pendingWithdrawals = pendingWithdrawals.filter(r => r.id !== reqId);
     bot.answerCallbackQuery(query.id, { text: 'تم الرفض ومصادرة العملات نهائياً! 🚫', show_alert: true });
     await sendAdminPanel(chatId, messageId);
@@ -314,7 +322,7 @@ bot.on('callback_query', async (query) => {
   else if (data === 'admin_top100') {
     let topText = `🏆 *قائمة المتصدرين الحقيقية:*\n\n`;
     try {
-      const usersData = await dbGet('users');
+      const usersData = await firebaseRequest('GET', 'users');
       const list = Object.entries(usersData && typeof usersData === 'object' ? usersData : {})
         .filter(([, u]) => u && typeof u === 'object')
         .map(([uId, u]) => ({
@@ -334,7 +342,7 @@ bot.on('callback_query', async (query) => {
           topText += `${medal} ${nameLabel} — *${item.balance}* ROL\n`;
         });
       }
-    } catch (err) {
+    } catch (e) {
       topText += `تعذر جلب القائمة حالياً.`;
     }
 
@@ -359,17 +367,13 @@ bot.on('message', async (msg) => {
   if (waitingForBanInput) {
     bannedUsers.add(targetId);
     waitingForBanInput = false;
-    try {
-      await dbPatch(`users/${targetId}`, { banned: true, bannedAt: Date.now() });
-    } catch (err) {}
+    await firebaseRequest('PATCH', `users/${targetId}`, { banned: true, bannedAt: Date.now() }).catch(() => {});
     bot.sendMessage(msg.chat.id, `✅ تم حظر المستخدم بنجاح: \`${targetId}\``, { parse_mode: 'Markdown' });
     await sendAdminPanel(msg.chat.id);
   } else if (waitingForUnbanInput) {
     bannedUsers.delete(targetId);
     waitingForUnbanInput = false;
-    try {
-      await dbPatch(`users/${targetId}`, { banned: false, banReason: '' });
-    } catch (err) {}
+    await firebaseRequest('PATCH', `users/${targetId}`, { banned: false, banReason: '' }).catch(() => {});
     bot.sendMessage(msg.chat.id, `✅ تم فك حظر المستخدم: \`${targetId}\``, { parse_mode: 'Markdown' });
     await sendAdminPanel(msg.chat.id);
   }
