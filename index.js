@@ -54,20 +54,6 @@ function firebaseRequest(method, path, bodyObj = null) {
   });
 }
 
-async function persistSystemConfig() {
-  const payload = {
-    maintenanceEnabled,
-    maintenanceMessage,
-    allowedTesters,
-    updatedAt: Date.now()
-  };
-  try {
-    await firebaseRequest('PATCH', 'config/system', payload);
-  } catch (e) {
-    console.log('System config save error:', e.message);
-  }
-}
-
 async function syncSystemAndStats() {
   try {
     const [sysData, usersData, withdrawalsData] = await Promise.all([
@@ -77,13 +63,9 @@ async function syncSystemAndStats() {
     ]);
 
     if (sysData && typeof sysData === 'object') {
-      if (typeof sysData.maintenanceEnabled === 'boolean') {
-        maintenanceEnabled = sysData.maintenanceEnabled;
-      }
+      maintenanceEnabled = Boolean(sysData.maintenanceEnabled);
       if (sysData.maintenanceMessage) maintenanceMessage = String(sysData.maintenanceMessage);
-      if (Array.isArray(sysData.allowedTesters)) {
-        allowedTesters = sysData.allowedTesters.map(String);
-      }
+      allowedTesters = Array.isArray(sysData.allowedTesters) ? sysData.allowedTesters.map(String) : [];
     }
 
     const usersObj = usersData && typeof usersData === 'object' ? usersData : {};
@@ -139,12 +121,12 @@ bot.on('polling_error', (err) => {
 bot.onText(/\/start/, async (msg) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
-  const firstName = msg.from.first_name || 'صديقي';
+  const firstName = msg.from.first_name || 'Miner';
 
   await syncSystemAndStats();
 
   if (bannedUsers.has(userId)) {
-    return bot.sendMessage(chatId, '🚫 عذراً، لقد تم حظر حسابك من استخدام هذا البوت.');
+    return bot.sendMessage(chatId, '🚫 Sorry, your account has been banned from using this bot.');
   }
 
   try {
@@ -172,9 +154,9 @@ bot.onText(/\/start/, async (msg) => {
 
   const maintParam = maintenanceEnabled ? '&maint=1' : '';
   const webAppUrlWithVersion = `${BASE_APP_URL}?v=${appVersion}${maintParam}`;
-  const welcomeText = `مرحباً بك يا ${firstName} في تطبيق تعدين ROL الرسمي!\n\nاضغط على الزر بالأسفل لفتح الواجهة وبدء التعدين:`;
+  const welcomeText = `Welcome ${firstName} to the official ROL Mining app!\n\nTap the button below to launch the mini app and start mining:`;
   const keyboard = [
-    [{ text: '🚀 ابدأ تعدين ROL الآن', web_app: { url: webAppUrlWithVersion } }]
+    [{ text: '🚀 Start ROL Mining Now', web_app: { url: webAppUrlWithVersion } }]
   ];
 
   if (userId === ADMIN_ID) {
@@ -262,8 +244,12 @@ bot.on('callback_query', async (query) => {
   }
   else if (data === 'admin_toggle_maintenance') {
     maintenanceEnabled = !maintenanceEnabled;
-    appVersion = Date.now();
-    await persistSystemConfig();
+    await firebaseRequest('PATCH', 'config/system', {
+      maintenanceEnabled,
+      maintenanceMessage,
+      allowedTesters,
+      updatedAt: Date.now()
+    }).catch(() => {});
     bot.answerCallbackQuery(query.id, {
       text: maintenanceEnabled ? 'تم تفعيل وضع الصيانة في التطبيق 🔴' : 'تم إيقاف وضع الصيانة 🟢',
       show_alert: true
@@ -436,7 +422,12 @@ bot.on('message', async (msg) => {
   } else if (currentAction === 'tester') {
     const strId = String(targetId);
     if (!allowedTesters.includes(strId)) allowedTesters.push(strId);
-    await persistSystemConfig();
+    await firebaseRequest('PATCH', 'config/system', {
+      maintenanceEnabled,
+      maintenanceMessage,
+      allowedTesters,
+      updatedAt: Date.now()
+    }).catch(() => {});
     bot.sendMessage(chatId, `🧪 تم إضافة المختبر بنجاح: \`${strId}\``, { parse_mode: 'Markdown' });
     await sendAdminPanel(chatId);
   }
