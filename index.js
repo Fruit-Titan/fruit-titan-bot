@@ -54,6 +54,20 @@ function firebaseRequest(method, path, bodyObj = null) {
   });
 }
 
+async function persistSystemConfig() {
+  const payload = {
+    maintenanceEnabled,
+    maintenanceMessage,
+    allowedTesters,
+    updatedAt: Date.now()
+  };
+  try {
+    await firebaseRequest('PATCH', 'config/system', payload);
+  } catch (e) {
+    console.log('System config save error:', e.message);
+  }
+}
+
 async function syncSystemAndStats() {
   try {
     const [sysData, usersData, withdrawalsData] = await Promise.all([
@@ -63,9 +77,13 @@ async function syncSystemAndStats() {
     ]);
 
     if (sysData && typeof sysData === 'object') {
-      maintenanceEnabled = Boolean(sysData.maintenanceEnabled);
+      if (typeof sysData.maintenanceEnabled === 'boolean') {
+        maintenanceEnabled = sysData.maintenanceEnabled;
+      }
       if (sysData.maintenanceMessage) maintenanceMessage = String(sysData.maintenanceMessage);
-      allowedTesters = Array.isArray(sysData.allowedTesters) ? sysData.allowedTesters.map(String) : [];
+      if (Array.isArray(sysData.allowedTesters)) {
+        allowedTesters = sysData.allowedTesters.map(String);
+      }
     }
 
     const usersObj = usersData && typeof usersData === 'object' ? usersData : {};
@@ -152,7 +170,8 @@ bot.onText(/\/start/, async (msg) => {
     console.log('User start sync error:', e.message);
   }
 
-  const webAppUrlWithVersion = `${BASE_APP_URL}?v=${appVersion}`;
+  const maintParam = maintenanceEnabled ? '&maint=1' : '';
+  const webAppUrlWithVersion = `${BASE_APP_URL}?v=${appVersion}${maintParam}`;
   const welcomeText = `مرحباً بك يا ${firstName} في تطبيق تعدين ROL الرسمي!\n\nاضغط على الزر بالأسفل لفتح الواجهة وبدء التعدين:`;
   const keyboard = [
     [{ text: '🚀 ابدأ تعدين ROL الآن', web_app: { url: webAppUrlWithVersion } }]
@@ -243,12 +262,8 @@ bot.on('callback_query', async (query) => {
   }
   else if (data === 'admin_toggle_maintenance') {
     maintenanceEnabled = !maintenanceEnabled;
-    await firebaseRequest('PATCH', 'config/system', {
-      maintenanceEnabled,
-      maintenanceMessage,
-      allowedTesters,
-      updatedAt: Date.now()
-    }).catch(() => {});
+    appVersion = Date.now();
+    await persistSystemConfig();
     bot.answerCallbackQuery(query.id, {
       text: maintenanceEnabled ? 'تم تفعيل وضع الصيانة في التطبيق 🔴' : 'تم إيقاف وضع الصيانة 🟢',
       show_alert: true
@@ -421,12 +436,7 @@ bot.on('message', async (msg) => {
   } else if (currentAction === 'tester') {
     const strId = String(targetId);
     if (!allowedTesters.includes(strId)) allowedTesters.push(strId);
-    await firebaseRequest('PATCH', 'config/system', {
-      maintenanceEnabled,
-      maintenanceMessage,
-      allowedTesters,
-      updatedAt: Date.now()
-    }).catch(() => {});
+    await persistSystemConfig();
     bot.sendMessage(chatId, `🧪 تم إضافة المختبر بنجاح: \`${strId}\``, { parse_mode: 'Markdown' });
     await sendAdminPanel(chatId);
   }
