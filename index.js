@@ -12,10 +12,10 @@ const bot = new TelegramBot(token, { polling: true });
 let bannedUsers = new Set();
 let pendingWithdrawals = [];
 let totalUsersCount = 0;
-let waitingForBanInput = false;
-let waitingForUnbanInput = false;
 let maintenanceEnabled = false;
-let maintenanceMessage = 'نقوم حالياً بتحديث النظام وتحسين الأداء لضمان أفضل تجربة تعدين. سنعود للعمل قريباً.';
+let maintenanceMessage = 'نقوم حالياً بتحديث النظام وتحسين الأداء. سنعود للعمل قريباً.';
+let allowedTesters = [];
+let adminInputState = null; // 'ban' | 'unban' | 'tester'
 let appVersion = Date.now();
 
 function firebaseRequest(method, path, bodyObj = null) {
@@ -64,9 +64,8 @@ async function syncSystemAndStats() {
 
     if (sysData && typeof sysData === 'object') {
       maintenanceEnabled = Boolean(sysData.maintenanceEnabled);
-      if (sysData.maintenanceMessage) {
-        maintenanceMessage = String(sysData.maintenanceMessage);
-      }
+      if (sysData.maintenanceMessage) maintenanceMessage = String(sysData.maintenanceMessage);
+      allowedTesters = Array.isArray(sysData.allowedTesters) ? sysData.allowedTesters.map(String) : [];
     }
 
     const usersObj = usersData && typeof usersData === 'object' ? usersData : {};
@@ -115,17 +114,6 @@ async function resetAllBalancesInFirebase() {
   return { resetCount, errorCount };
 }
 
-function buildMaintenanceNoticeText() {
-  return (
-    `🛠️ *البوت قيد الصيانة حالياً*\n` +
-    `━━━━━━━━━━━━━━━━━━\n` +
-    `📌 *الحالة:* جاري التطوير والصيانة الدورية\n` +
-    `💬 *التفاصيل:* ${maintenanceMessage}\n` +
-    `━━━━━━━━━━━━━━━━━━\n` +
-    `⏳ نعتذر عن الإزعاج المؤقت، وسنعود للعمل بأسرع وقت.`
-  );
-}
-
 bot.on('polling_error', (err) => {
   console.log('Polling error:', err.message);
 });
@@ -136,10 +124,6 @@ bot.onText(/\/start/, async (msg) => {
   const firstName = msg.from.first_name || 'صديقي';
 
   await syncSystemAndStats();
-
-  if (userId !== ADMIN_ID && maintenanceEnabled) {
-    return bot.sendMessage(chatId, buildMaintenanceNoticeText(), { parse_mode: 'Markdown' });
-  }
 
   if (bannedUsers.has(userId)) {
     return bot.sendMessage(chatId, '🚫 عذراً، لقد تم حظر حسابك من استخدام هذا البوت.');
@@ -165,15 +149,11 @@ bot.onText(/\/start/, async (msg) => {
       });
     }
   } catch (e) {
-    console.log('User start error:', e.message);
+    console.log('User start sync error:', e.message);
   }
 
   const webAppUrlWithVersion = `${BASE_APP_URL}?v=${appVersion}`;
-  const adminNote = (userId === ADMIN_ID && maintenanceEnabled)
-    ? '\n\n⚠️ *ملاحظة:* وضع الصيانة مفعّل حالياً للمستخدمين، وأنت داخل بصلاحية المشرف للاختبار.'
-    : '';
-
-  const welcomeText = `مرحباً بك يا ${firstName} في تطبيق تعدين ROL الرسمي!\n\nاضغط على الزر بالأسفل لفتح الواجهة وبدء التعدين:${adminNote}`;
+  const welcomeText = `مرحباً بك يا ${firstName} في تطبيق تعدين ROL الرسمي!\n\nاضغط على الزر بالأسفل لفتح الواجهة وبدء التعدين:`;
   const keyboard = [
     [{ text: '🚀 ابدأ تعدين ROL الآن', web_app: { url: webAppUrlWithVersion } }]
   ];
@@ -198,13 +178,14 @@ bot.onText(/\/admin/, (msg) => {
 async function sendAdminPanel(chatId, messageId = null) {
   await syncSystemAndStats();
 
-  const maintBadge = maintenanceEnabled ? 'مفعّل 🔴 (وضع الصيانة)' : 'متوقف 🟢';
+  const maintBadge = maintenanceEnabled ? 'مفعّل في التطبيق 🔴' : 'متوقف 🟢';
 
   const text = `👑 *لوحة تحكم المشرف العليا (ROL Admin)*\n\n` +
                `👥 إجمالي المستخدمين: *${totalUsersCount}*\n` +
                `🚫 عدد المحظورين: *${bannedUsers.size}*\n` +
                `📥 طلبات السحب المعلقة: *${pendingWithdrawals.length}*\n` +
-               `🛠️ حالة وضع الصيانة: *${maintBadge}*\n\n` +
+               `🛠️ صيانة التطبيق: *${maintBadge}*\n` +
+               `🧪 المختبرون المسموح لهم: *${allowedTesters.length}*\n\n` +
                `اختر الإجراء المطلوب:`;
 
   const inline_keyboard = [
@@ -218,9 +199,10 @@ async function sendAdminPanel(chatId, messageId = null) {
     ],
     [
       {
-        text: maintenanceEnabled ? '🟢 إيقاف وضع الصيانة' : '🔴 تفعيل وضع الصيانة',
+        text: maintenanceEnabled ? '🟢 إيقاف صيانة التطبيق' : '🔴 تفعيل صيانة التطبيق',
         callback_data: 'admin_toggle_maintenance'
-      }
+      },
+      { text: '🧪 إضافة مختبر', callback_data: 'admin_add_tester' }
     ],
     [
       { text: '⚠️ تصفير جميع الأرصدة (Reset)', callback_data: 'admin_confirm_reset' }
@@ -264,13 +246,19 @@ bot.on('callback_query', async (query) => {
     await firebaseRequest('PATCH', 'config/system', {
       maintenanceEnabled,
       maintenanceMessage,
+      allowedTesters,
       updatedAt: Date.now()
     }).catch(() => {});
     bot.answerCallbackQuery(query.id, {
-      text: maintenanceEnabled ? 'تم تفعيل وضع الصيانة 🔴' : 'تم إيقاف وضع الصيانة 🟢',
+      text: maintenanceEnabled ? 'تم تفعيل وضع الصيانة في التطبيق 🔴' : 'تم إيقاف وضع الصيانة 🟢',
       show_alert: true
     });
     await sendAdminPanel(chatId, messageId);
+  }
+  else if (data === 'admin_add_tester') {
+    adminInputState = 'tester';
+    bot.sendMessage(chatId, 'أرسل الآن Telegram ID الخاص بالمختبر للسماح له بدخول التطبيق أثناء الصيانة:');
+    bot.answerCallbackQuery(query.id);
   }
   else if (data === 'admin_confirm_reset') {
     const confirmText = `⚠️ *تحذير خطير: تصفير الأرصدة*\n\n` +
@@ -359,14 +347,12 @@ bot.on('callback_query', async (query) => {
     await sendAdminPanel(chatId, messageId);
   }
   else if (data === 'admin_ban') {
-    waitingForBanInput = true;
-    waitingForUnbanInput = false;
+    adminInputState = 'ban';
     bot.sendMessage(chatId, 'أرسل الآن الـ ID الخاص بالحساب المراد حظره:');
     bot.answerCallbackQuery(query.id);
   }
   else if (data === 'admin_unban') {
-    waitingForUnbanInput = true;
-    waitingForBanInput = false;
+    adminInputState = 'unban';
     bot.sendMessage(chatId, 'أرسل الآن الـ ID الخاص بالحساب المراد فك حظره:');
     bot.answerCallbackQuery(query.id);
   }
@@ -410,39 +396,39 @@ bot.on('callback_query', async (query) => {
 });
 
 bot.on('message', async (msg) => {
-  if (!msg.from || !msg.text) return;
+  if (!msg.from || msg.from.id !== ADMIN_ID || !msg.text || msg.text.startsWith('/')) return;
+  if (!adminInputState) return;
+
   const chatId = msg.chat.id;
-  const userId = msg.from.id;
-
-  if (userId === ADMIN_ID && !msg.text.startsWith('/')) {
-    const targetId = parseInt(msg.text.trim(), 10);
-    if (isNaN(targetId)) return;
-
-    if (waitingForBanInput) {
-      bannedUsers.add(targetId);
-      waitingForBanInput = false;
-      await firebaseRequest('PATCH', `users/${targetId}`, { banned: true, bannedAt: Date.now() }).catch(() => {});
-      bot.sendMessage(chatId, `✅ تم حظر المستخدم بنجاح: \`${targetId}\``, { parse_mode: 'Markdown' });
-      await sendAdminPanel(chatId);
-      return;
-    }
-
-    if (waitingForUnbanInput) {
-      bannedUsers.delete(targetId);
-      waitingForUnbanInput = false;
-      await firebaseRequest('PATCH', `users/${targetId}`, { banned: false, banReason: '' }).catch(() => {});
-      bot.sendMessage(chatId, `✅ تم فك حظر المستخدم: \`${targetId}\``, { parse_mode: 'Markdown' });
-      await sendAdminPanel(chatId);
-      return;
-    }
+  const targetId = parseInt(msg.text.trim(), 10);
+  if (isNaN(targetId)) {
+    return bot.sendMessage(chatId, '⚠️ يرجى إرسال رقم ID صحيح.');
   }
 
-  // حجب الرسائل النصية للمستخدمين العاديين أثناء وضع الصيانة مع استثناء الأدمن
-  if (userId !== ADMIN_ID && !msg.text.startsWith('/start')) {
-    await syncSystemAndStats();
-    if (maintenanceEnabled) {
-      bot.sendMessage(chatId, buildMaintenanceNoticeText(), { parse_mode: 'Markdown' });
-    }
+  const currentAction = adminInputState;
+  adminInputState = null;
+
+  if (currentAction === 'ban') {
+    bannedUsers.add(targetId);
+    await firebaseRequest('PATCH', `users/${targetId}`, { banned: true, bannedAt: Date.now() }).catch(() => {});
+    bot.sendMessage(chatId, `✅ تم حظر المستخدم بنجاح: \`${targetId}\``, { parse_mode: 'Markdown' });
+    await sendAdminPanel(chatId);
+  } else if (currentAction === 'unban') {
+    bannedUsers.delete(targetId);
+    await firebaseRequest('PATCH', `users/${targetId}`, { banned: false, banReason: '' }).catch(() => {});
+    bot.sendMessage(chatId, `✅ تم فك حظر المستخدم: \`${targetId}\``, { parse_mode: 'Markdown' });
+    await sendAdminPanel(chatId);
+  } else if (currentAction === 'tester') {
+    const strId = String(targetId);
+    if (!allowedTesters.includes(strId)) allowedTesters.push(strId);
+    await firebaseRequest('PATCH', 'config/system', {
+      maintenanceEnabled,
+      maintenanceMessage,
+      allowedTesters,
+      updatedAt: Date.now()
+    }).catch(() => {});
+    bot.sendMessage(chatId, `🧪 تم إضافة المختبر بنجاح: \`${strId}\``, { parse_mode: 'Markdown' });
+    await sendAdminPanel(chatId);
   }
 });
 
