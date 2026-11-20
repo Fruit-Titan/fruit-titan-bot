@@ -1,10 +1,12 @@
 const TelegramBot = require('node-telegram-bot-api');
 const http = require('http');
 const https = require('https');
+const url = require('url');
 
 const token = process.env.BOT_TOKEN || '9185746835:AAFSJXdgMJI_SH-klpoTpowKMzDQocSOqVo';
 const FIREBASE_DB_URL = (process.env.FIREBASE_DB_URL || 'https://rol-mining-default-rtdb.firebaseio.com').replace(/\/+$/, '');
 const BASE_APP_URL = process.env.WEBAPP_URL || 'https://fruit-titan.github.io/fruit-titan-app/';
+const REQUIRED_CHANNEL_USERNAME = process.env.REQUIRED_CHANNEL || 'ROL_TOKN';
 const ADMIN_ID = 1932161126;
 
 const bot = new TelegramBot(token, { polling: true });
@@ -53,6 +55,19 @@ function firebaseRequest(method, path, bodyObj = null) {
     if (payload) req.write(payload);
     req.end();
   });
+}
+
+async function isUserSubscribedToChannel(userId) {
+  try {
+    const cleanId = Number(userId);
+    if (!cleanId || Number.isNaN(cleanId)) return false;
+    const member = await bot.getChatMember(`@${REQUIRED_CHANNEL_USERNAME}`, cleanId);
+    const allowedStatuses = ['creator', 'administrator', 'member'];
+    return Boolean(member && allowedStatuses.includes(member.status));
+  } catch (err) {
+    console.log('Channel membership check error:', err.message);
+    return false;
+  }
 }
 
 async function syncSystemAndStats() {
@@ -121,10 +136,11 @@ bot.on('polling_error', (err) => {
   console.log('Polling error:', err.message);
 });
 
-bot.onText(/\/start/, async (msg) => {
+bot.onText(/\/start(.*)/, async (msg, match) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
   const firstName = msg.from.first_name || 'Miner';
+  const startParam = match && match[1] ? match[1].trim() : '';
 
   await syncSystemAndStats();
 
@@ -135,7 +151,7 @@ bot.onText(/\/start/, async (msg) => {
   try {
     const existing = await firebaseRequest('GET', `users/${userId}`).catch(() => null);
     if (!existing || typeof existing !== 'object') {
-      await firebaseRequest('PATCH', `users/${userId}`, {
+      const patchData = {
         uid: String(userId),
         username: msg.from.username || '',
         firstName,
@@ -144,7 +160,14 @@ bot.onText(/\/start/, async (msg) => {
         banned: false,
         createdAt: Date.now(),
         updatedAt: Date.now()
-      });
+      };
+      if (startParam && startParam.startsWith('ref_')) {
+        const refId = startParam.replace('ref_', '').trim();
+        if (refId && refId !== String(userId)) {
+          patchData.referredBy = refId;
+        }
+      }
+      await firebaseRequest('PATCH', `users/${userId}`, patchData);
     } else {
       await firebaseRequest('PATCH', `users/${userId}`, {
         username: msg.from.username || existing.username || '',
@@ -156,7 +179,8 @@ bot.onText(/\/start/, async (msg) => {
   }
 
   const maintParam = maintenanceEnabled ? '&maint=1' : '';
-  const webAppUrlWithVersion = `${BASE_APP_URL}?v=${appVersion}${maintParam}`;
+  const refQuery = startParam ? `&tgWebAppStartParam=${encodeURIComponent(startParam)}` : '';
+  const webAppUrlWithVersion = `${BASE_APP_URL}?v=${appVersion}${maintParam}${refQuery}`;
   const welcomeText = `Welcome ${firstName} to the official ROL Mining app!\n\nTap the button below to launch the mini app and start mining:`;
   const keyboard = [
     [{ text: '🚀 Start ROL Mining Now', web_app: { url: webAppUrlWithVersion } }]
@@ -322,6 +346,7 @@ bot.on('callback_query', async (query) => {
     const text = `📥 *طلب سحب معلق:*\n\n` +
                  `👤 آيدي المستخدم: \`${reqUid}\`\n` +
                  `💰 الكمية: *${req.amount || 0} ROL*\n` +
+                 `💸 الرسوم (5%): *${req.feeAmount || 0} ROL* | الصافي: *${req.netAmount || req.amount || 0} ROL*\n` +
                  `🏦 المحفظة: \`${req.address || '-'}\`\n\n` +
                  `اختر الإجراء:`;
 
@@ -538,6 +563,31 @@ bot.on('message', async (msg) => {
 
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+
+  const parsedUrl = url.parse(req.url, true);
+  if (req.method === 'GET' && parsedUrl.pathname === '/api/check-channel') {
+    const targetUserId = parsedUrl.query?.userId || '';
+    isUserSubscribedToChannel(targetUserId)
+      .then((joined) => {
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: true, joined: Boolean(joined) }));
+      })
+      .catch(() => {
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, joined: false }));
+      });
+    return;
+  }
+
   res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
   res.end('ROL Mining Bot is Live and Active.');
 }).listen(PORT, '0.0.0.0', () => {
