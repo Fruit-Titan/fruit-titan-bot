@@ -260,7 +260,8 @@ function sendAdminPanel(chatId, messageId = null) {
       {
         text: store.system.maintenanceEnabled ? '🟢 إيقاف صيانة التطبيق' : '🔴 تفعيل صيانة التطبيق',
         callback_data: 'admin_toggle_maintenance'
-      }
+      },
+      { text: '💾 نسخة احتياطية للبيانات', callback_data: 'admin_backup' }
     ],
     [
       { text: '⚠️ تصفير جميع الأرصدة (Reset)', callback_data: 'admin_confirm_reset' }
@@ -298,6 +299,15 @@ bot.on('callback_query', (query) => {
   if (data === 'admin_panel') {
     sendAdminPanel(chatId, messageId);
     bot.answerCallbackQuery(query.id);
+  }
+  else if (data === 'admin_backup') {
+    saveStore();
+    if (fs.existsSync(DATA_FILE)) {
+      bot.sendDocument(chatId, DATA_FILE, {
+        caption: '💾 نسخة احتياطية لبيانات البوت والمستخدمين والمهام'
+      }).catch(() => {});
+    }
+    bot.answerCallbackQuery(query.id, { text: 'تم إرسال النسخة الاحتياطية 💾', show_alert: true });
   }
   else if (data === 'admin_tasks_report') {
     const tasksList = Array.isArray(store.paidTasks) ? store.paidTasks : [];
@@ -640,19 +650,25 @@ http.createServer((req, res) => {
           res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
           return res.end(JSON.stringify({ ok: false, error: 'Invalid task data' }));
         }
+        const taskId = String(tData.id || `ctask_${Date.now()}_${Math.floor(Math.random() * 1000)}`);
+        const existingIdx = (store.paidTasks || []).findIndex(item => String(item.id) === taskId);
         const taskObj = {
-          id: String(tData.id || `ctask_${Date.now()}_${Math.floor(Math.random() * 1000)}`),
+          id: taskId,
           url: String(tData.url),
           label: String(tData.label || tData.url),
           targetUsers: targetUsers,
-          completedCount: 0,
-          completedBy: [],
+          completedCount: existingIdx >= 0 ? Number(store.paidTasks[existingIdx].completedCount || 0) : 0,
+          completedBy: existingIdx >= 0 && Array.isArray(store.paidTasks[existingIdx].completedBy) ? store.paidTasks[existingIdx].completedBy : [],
           rewardRol: 10,
           paidGram: Number(tData.paidGram || ((targetUsers / 50) * 1).toFixed(4)),
           createdBy: String(tData.createdBy || ''),
-          createdAt: Date.now()
+          createdAt: existingIdx >= 0 ? Number(store.paidTasks[existingIdx].createdAt || Date.now()) : Date.now()
         };
-        store.paidTasks.unshift(taskObj);
+        if (existingIdx >= 0) {
+          store.paidTasks[existingIdx] = taskObj;
+        } else {
+          store.paidTasks.unshift(taskObj);
+        }
         saveStore();
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
         res.end(JSON.stringify({ ok: true, task: taskObj }));
@@ -672,7 +688,24 @@ http.createServer((req, res) => {
         const payload = JSON.parse(body || '{}');
         const taskId = String(payload.taskId || '').trim();
         const uId = String(payload.uid || '').trim();
-        const idx = (store.paidTasks || []).findIndex(t => String(t.id) === taskId);
+        let idx = (store.paidTasks || []).findIndex(t => String(t.id) === taskId);
+
+        if (idx === -1 && payload.taskMeta && payload.taskMeta.url) {
+          const metaUsers = parseInt(payload.taskMeta.targetUsers || '50', 10);
+          store.paidTasks.unshift({
+            id: taskId || `ctask_${Date.now()}`,
+            url: String(payload.taskMeta.url),
+            label: String(payload.taskMeta.label || payload.taskMeta.url),
+            targetUsers: isNaN(metaUsers) ? 50 : metaUsers,
+            completedCount: 0,
+            completedBy: [],
+            rewardRol: 10,
+            paidGram: Number(payload.taskMeta.paidGram || 1),
+            createdBy: String(payload.taskMeta.createdBy || ''),
+            createdAt: Number(payload.taskMeta.createdAt || Date.now())
+          });
+          idx = 0;
+        }
 
         if (idx === -1) {
           res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
