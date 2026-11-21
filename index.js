@@ -15,6 +15,7 @@ const bot = new TelegramBot(token, { polling: true });
 let store = {
   users: {},
   withdrawals: {},
+  paidTasks: [],
   system: {
     maintenanceEnabled: false,
     maintenanceMessage: 'نقوم حالياً بتحديث النظام وتحسين الأداء. سنعود للعمل قريباً.',
@@ -34,6 +35,7 @@ function loadStore() {
         store = {
           users: parsed.users && typeof parsed.users === 'object' ? parsed.users : {},
           withdrawals: parsed.withdrawals && typeof parsed.withdrawals === 'object' ? parsed.withdrawals : {},
+          paidTasks: Array.isArray(parsed.paidTasks) ? parsed.paidTasks : [],
           system: {
             maintenanceEnabled: Boolean(parsed.system?.maintenanceEnabled),
             maintenanceMessage: parsed.system?.maintenanceMessage || store.system.maintenanceMessage,
@@ -247,15 +249,18 @@ function sendAdminPanel(chatId, messageId = null) {
       { text: '👥 إحصائيات المستخدمين', callback_data: 'admin_real_users' }
     ],
     [
-      { text: '🚫 حظر مستخدم', callback_data: 'admin_ban' },
-      { text: '✅ إلغاء حظر', callback_data: 'admin_unban' }
+      { text: '📋 المهام (الحالية والسابقة)', callback_data: 'admin_tasks_report' },
+      { text: '🚫 حظر مستخدم', callback_data: 'admin_ban' }
+    ],
+    [
+      { text: '✅ إلغاء حظر', callback_data: 'admin_unban' },
+      { text: '🧪 إضافة مختبر', callback_data: 'admin_add_tester' }
     ],
     [
       {
         text: store.system.maintenanceEnabled ? '🟢 إيقاف صيانة التطبيق' : '🔴 تفعيل صيانة التطبيق',
         callback_data: 'admin_toggle_maintenance'
-      },
-      { text: '🧪 إضافة مختبر', callback_data: 'admin_add_tester' }
+      }
     ],
     [
       { text: '⚠️ تصفير جميع الأرصدة (Reset)', callback_data: 'admin_confirm_reset' }
@@ -292,6 +297,38 @@ bot.on('callback_query', (query) => {
 
   if (data === 'admin_panel') {
     sendAdminPanel(chatId, messageId);
+    bot.answerCallbackQuery(query.id);
+  }
+  else if (data === 'admin_tasks_report') {
+    const tasksList = Array.isArray(store.paidTasks) ? store.paidTasks : [];
+    let report = `📋 *تقرير المهام (الحالية والسابقة):*\n\n`;
+
+    if (tasksList.length === 0) {
+      report += `_لا توجد مهام مضافة حتى الآن._`;
+    } else {
+      tasksList.slice().reverse().slice(0, 30).forEach((tItem, idx) => {
+        const doneCnt = Number(tItem.completedCount || 0);
+        const targetCnt = Number(tItem.targetUsers || 0);
+        const isFinished = doneCnt >= targetCnt;
+        const statusLabel = isFinished ? 'منتهية ✅' : 'نشطة 🟢';
+        report += `${idx + 1}. *${tItem.label || tItem.url}* — *${statusLabel}*\n` +
+                  `   👥 المنفّذون: *${doneCnt}* / *${targetCnt}* | 💎 المكافأة: *${tItem.rewardRol || 10} ROL*\n` +
+                  `   🔗 \`${tItem.url || '-'}\`\n`;
+      });
+    }
+
+    if (report.length > 3900) {
+      report = report.slice(0, 3850) + '\n...';
+    }
+
+    bot.editMessageText(report, {
+      chat_id: chatId,
+      message_id: messageId,
+      parse_mode: 'Markdown',
+      reply_markup: {
+        inline_keyboard: [[{ text: '🔙 رجوع للوحة التحكم', callback_data: 'admin_panel' }]]
+      }
+    }).catch(() => {});
     bot.answerCallbackQuery(query.id);
   }
   else if (data === 'admin_toggle_maintenance') {
@@ -580,6 +617,94 @@ http.createServer((req, res) => {
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
         res.end(JSON.stringify({ ok: false, joined: false }));
       });
+    return;
+  }
+
+  if (req.method === 'GET' && parsedUrl.pathname === '/api/tasks') {
+    const activeTasks = (store.paidTasks || []).filter(
+      t => Number(t.completedCount || 0) < Number(t.targetUsers || 0)
+    );
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify({ ok: true, tasks: activeTasks }));
+    return;
+  }
+
+  if (req.method === 'POST' && parsedUrl.pathname === '/api/tasks') {
+    let body = '';
+    req.on('data', chunk => { body += chunk; });
+    req.on('end', () => {
+      try {
+        const tData = JSON.parse(body || '{}');
+        const targetUsers = parseInt(tData.targetUsers || '0', 10);
+        if (!tData.url || isNaN(targetUsers) || targetUsers < 50) {
+          res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+          return res.end(JSON.stringify({ ok: false, error: 'Invalid task data' }));
+        }
+        const taskObj = {
+          id: String(tData.id || `ctask_${Date.now()}_${Math.floor(Math.random() * 1000)}`),
+          url: String(tData.url),
+          label: String(tData.label || tData.url),
+          targetUsers: targetUsers,
+          completedCount: 0,
+          completedBy: [],
+          rewardRol: 10,
+          paidGram: Number(tData.paidGram || ((targetUsers / 50) * 1).toFixed(4)),
+          createdBy: String(tData.createdBy || ''),
+          createdAt: Date.now()
+        };
+        store.paidTasks.unshift(taskObj);
+        saveStore();
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: true, task: taskObj }));
+      } catch (e) {
+        res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, error: e.message }));
+      }
+    });
+    return;
+  }
+
+  if (req.method === 'POST' && parsedUrl.pathname === '/api/tasks/complete') {
+    let body = '';
+    req.on('data', chunk => { body += chunk; });
+    req.on('end', () => {
+      try {
+        const payload = JSON.parse(body || '{}');
+        const taskId = String(payload.taskId || '').trim();
+        const uId = String(payload.uid || '').trim();
+        const idx = (store.paidTasks || []).findIndex(t => String(t.id) === taskId);
+
+        if (idx === -1) {
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          return res.end(JSON.stringify({ ok: false, expired: true }));
+        }
+
+        const taskObj = store.paidTasks[idx];
+        if (!Array.isArray(taskObj.completedBy)) taskObj.completedBy = [];
+        if (uId && uId !== 'guest_miner' && taskObj.completedBy.includes(uId)) {
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          return res.end(JSON.stringify({ ok: false, alreadyCompleted: true }));
+        }
+
+        if (Number(taskObj.completedCount || 0) >= Number(taskObj.targetUsers || 0)) {
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          return res.end(JSON.stringify({ ok: false, expired: true }));
+        }
+
+        if (uId && uId !== 'guest_miner') {
+          taskObj.completedBy.push(uId);
+        }
+        taskObj.completedCount = Number(taskObj.completedCount || 0) + 1;
+        saveStore();
+
+        const stillActive = taskObj.completedCount < Number(taskObj.targetUsers || 0);
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: true, rewardRol: 10, stillActive }));
+      } catch (e) {
+        res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, error: e.message }));
+      }
+    });
     return;
   }
 
