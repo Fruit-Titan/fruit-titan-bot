@@ -1,60 +1,98 @@
 const TelegramBot = require('node-telegram-bot-api');
 const http = require('http');
-const https = require('https');
 const url = require('url');
+const fs = require('fs');
+const path = require('path');
 
 const token = process.env.BOT_TOKEN || '9185746835:AAFSJXdgMJI_SH-klpoTpowKMzDQocSOqVo';
-const FIREBASE_DB_URL = (process.env.FIREBASE_DB_URL || 'https://rol-mining-default-rtdb.firebaseio.com').replace(/\/+$/, '');
 const BASE_APP_URL = process.env.WEBAPP_URL || 'https://fruit-titan.github.io/fruit-titan-app/';
 const REQUIRED_CHANNEL_USERNAME = process.env.REQUIRED_CHANNEL || 'ROL_TOKN';
 const ADMIN_ID = 1932161126;
+const DATA_FILE = path.join(__dirname, 'rol_bot_data.json');
 
 const bot = new TelegramBot(token, { polling: true });
 
-let bannedUsers = new Set();
-let pendingWithdrawals = [];
-let totalUsersCount = 0;
-let activeHoldersCount = 0;
-let maintenanceEnabled = false;
-let maintenanceMessage = 'نقوم حالياً بتحديث النظام وتحسين الأداء. سنعود للعمل قريباً.';
-let allowedTesters = [];
+let store = {
+  users: {},
+  withdrawals: {},
+  system: {
+    maintenanceEnabled: false,
+    maintenanceMessage: 'نقوم حالياً بتحديث النظام وتحسين الأداء. سنعود للعمل قريباً.',
+    allowedTesters: []
+  }
+};
+
 let adminInputState = null; // 'ban' | 'unban' | 'tester' | 'history'
 let appVersion = Date.now();
 
-function firebaseRequest(method, path, bodyObj = null) {
-  return new Promise((resolve, reject) => {
-    const cleanPath = path.replace(/^\/+/, '');
-    const fullUrl = new URL(`${FIREBASE_DB_URL}/${cleanPath}.json`);
-    const payload = bodyObj ? JSON.stringify(bodyObj) : null;
-
-    const req = https.request({
-      hostname: fullUrl.hostname,
-      path: `${fullUrl.pathname}${fullUrl.search}`,
-      method,
-      headers: {
-        'Content-Type': 'application/json',
-        ...(payload ? { 'Content-Length': Buffer.byteLength(payload) } : {})
-      }
-    }, (res) => {
-      let raw = '';
-      res.on('data', chunk => raw += chunk);
-      res.on('end', () => {
-        if (res.statusCode >= 200 && res.statusCode < 300) {
-          try {
-            resolve(raw ? JSON.parse(raw) : null);
-          } catch {
-            resolve(null);
+function loadStore() {
+  try {
+    if (fs.existsSync(DATA_FILE)) {
+      const raw = fs.readFileSync(DATA_FILE, 'utf8');
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object') {
+        store = {
+          users: parsed.users && typeof parsed.users === 'object' ? parsed.users : {},
+          withdrawals: parsed.withdrawals && typeof parsed.withdrawals === 'object' ? parsed.withdrawals : {},
+          system: {
+            maintenanceEnabled: Boolean(parsed.system?.maintenanceEnabled),
+            maintenanceMessage: parsed.system?.maintenanceMessage || store.system.maintenanceMessage,
+            allowedTesters: Array.isArray(parsed.system?.allowedTesters) ? parsed.system.allowedTesters.map(String) : []
           }
-        } else {
-          reject(new Error(`Firebase ${method} ${res.statusCode}`));
-        }
-      });
-    });
+        };
+      }
+    }
+  } catch (e) {
+    console.log('Load store notice:', e.message);
+  }
+}
 
-    req.on('error', reject);
-    if (payload) req.write(payload);
-    req.end();
+function saveStore() {
+  try {
+    fs.writeFileSync(DATA_FILE, JSON.stringify(store, null, 2), 'utf8');
+  } catch (e) {
+    console.log('Save store notice:', e.message);
+  }
+}
+
+function addUserHistory(userId, source, amount, details = '', balanceAfter = null) {
+  const key = String(userId);
+  if (!key || key === 'guest_miner') return;
+  if (!store.users[key]) {
+    store.users[key] = {
+      uid: key,
+      username: '',
+      firstName: 'Miner',
+      balance: 0,
+      vip: 1,
+      banned: false,
+      isVerified: false,
+      wallet: '',
+      onChainWalletROL: 0,
+      refCount: 0,
+      refEarn: 0,
+      completedTasks: [],
+      history: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now()
+    };
+  }
+  if (!Array.isArray(store.users[key].history)) {
+    store.users[key].history = [];
+  }
+  const numAmount = Number(amount || 0);
+  store.users[key].history.push({
+    source: String(source || 'عملية'),
+    amount: numAmount,
+    details: String(details || ''),
+    balanceAfter: balanceAfter !== null ? Number(balanceAfter) : Number(store.users[key].balance || 0),
+    timestamp: Date.now()
   });
+  if (store.users[key].history.length > 100) {
+    store.users[key].history = store.users[key].history.slice(-100);
+  }
+  store.users[key].updatedAt = Date.now();
+  saveStore();
 }
 
 async function isUserSubscribedToChannel(userId) {
@@ -70,115 +108,94 @@ async function isUserSubscribedToChannel(userId) {
   }
 }
 
-async function syncSystemAndStats() {
-  try {
-    const [sysData, usersData, withdrawalsData] = await Promise.all([
-      firebaseRequest('GET', 'config/system').catch(() => null),
-      firebaseRequest('GET', 'users').catch(() => ({})),
-      firebaseRequest('GET', 'withdrawals').catch(() => ({}))
-    ]);
-
-    if (sysData && typeof sysData === 'object') {
-      maintenanceEnabled = Boolean(sysData.maintenanceEnabled);
-      if (sysData.maintenanceMessage) maintenanceMessage = String(sysData.maintenanceMessage);
-      allowedTesters = Array.isArray(sysData.allowedTesters) ? sysData.allowedTesters.map(String) : [];
-    }
-
-    const usersObj = usersData && typeof usersData === 'object' ? usersData : {};
-    const withdrawalsObj = withdrawalsData && typeof withdrawalsData === 'object' ? withdrawalsData : {};
-
-    const validUserEntries = Object.entries(usersObj).filter(([k, u]) => u && typeof u === 'object' && k !== 'guest_miner');
-    totalUsersCount = validUserEntries.length;
-    activeHoldersCount = validUserEntries.filter(([, u]) => Number(u.balance || 0) > 0).length;
-    bannedUsers = new Set(
-      Object.entries(usersObj)
-        .filter(([, u]) => u && u.banned)
-        .map(([uid]) => Number(uid))
-        .filter(n => !Number.isNaN(n))
-    );
-
-    pendingWithdrawals = Object.entries(withdrawalsObj)
-      .filter(([, w]) => w && w.status === 'pending')
-      .map(([id, w]) => ({ id, ...w }));
-  } catch (e) {
-    console.log('Sync warning:', e.message);
-  }
+function getRealUsersList() {
+  return Object.entries(store.users || {})
+    .filter(([k, u]) => u && typeof u === 'object' && k !== 'guest_miner');
 }
 
-async function resetAllBalancesInFirebase() {
-  const usersData = await firebaseRequest('GET', 'users');
-  if (!usersData || typeof usersData !== 'object') {
-    return { resetCount: 0, errorCount: 0 };
-  }
+function getBannedSet() {
+  return new Set(
+    getRealUsersList()
+      .filter(([, u]) => Boolean(u.banned))
+      .map(([uid]) => Number(uid))
+      .filter(n => !Number.isNaN(n))
+  );
+}
 
+function getPendingWithdrawalsList() {
+  return Object.entries(store.withdrawals || {})
+    .filter(([, w]) => w && w.status === 'pending')
+    .map(([id, w]) => ({ id, ...w }));
+}
+
+function resetAllBalancesLocal() {
+  const list = getRealUsersList();
   let resetCount = 0;
-  let errorCount = 0;
-
-  for (const [uidKey, uVal] of Object.entries(usersData)) {
-    if (!uVal || typeof uVal !== 'object') continue;
-    try {
-      await firebaseRequest('PATCH', `users/${uidKey}`, {
-        balance: 0,
-        startTime: 0,
-        resetAt: Date.now()
-      });
-      resetCount++;
-    } catch (e) {
-      console.log(`Reset failed for ${uidKey}:`, e.message);
-      errorCount++;
-    }
+  for (const [uidKey, uVal] of list) {
+    store.users[uidKey] = {
+      ...uVal,
+      balance: 0,
+      startTime: 0,
+      resetAt: Date.now()
+    };
+    addUserHistory(uidKey, 'Admin Reset', 0, 'Balance reset by admin', 0);
+    resetCount++;
   }
-
-  return { resetCount, errorCount };
+  saveStore();
+  return resetCount;
 }
+
+loadStore();
 
 bot.on('polling_error', (err) => {
   console.log('Polling error:', err.message);
 });
 
-bot.onText(/\/start(.*)/, async (msg, match) => {
+bot.onText(/\/start(.*)/, (msg, match) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
   const firstName = msg.from.first_name || 'Miner';
   const startParam = match && match[1] ? match[1].trim() : '';
 
-  await syncSystemAndStats();
-
+  const bannedUsers = getBannedSet();
   if (bannedUsers.has(userId)) {
     return bot.sendMessage(chatId, '🚫 Sorry, your account has been banned from using this bot.');
   }
 
-  try {
-    const existing = await firebaseRequest('GET', `users/${userId}`).catch(() => null);
-    if (!existing || typeof existing !== 'object') {
-      const patchData = {
-        uid: String(userId),
-        username: msg.from.username || '',
-        firstName,
-        balance: 0,
-        vip: 1,
-        banned: false,
-        createdAt: Date.now(),
-        updatedAt: Date.now()
-      };
-      if (startParam && startParam.startsWith('ref_')) {
-        const refId = startParam.replace('ref_', '').trim();
-        if (refId && refId !== String(userId)) {
-          patchData.referredBy = refId;
-        }
+  const uidStr = String(userId);
+  if (!store.users[uidStr]) {
+    store.users[uidStr] = {
+      uid: uidStr,
+      username: msg.from.username || '',
+      firstName,
+      balance: 0,
+      vip: 1,
+      banned: false,
+      isVerified: false,
+      wallet: '',
+      onChainWalletROL: 0,
+      refCount: 0,
+      refEarn: 0,
+      completedTasks: [],
+      history: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now()
+    };
+    if (startParam && startParam.startsWith('ref_')) {
+      const refId = startParam.replace('ref_', '').trim();
+      if (refId && refId !== uidStr) {
+        store.users[uidStr].referredBy = refId;
       }
-      await firebaseRequest('PATCH', `users/${userId}`, patchData);
-    } else {
-      await firebaseRequest('PATCH', `users/${userId}`, {
-        username: msg.from.username || existing.username || '',
-        updatedAt: Date.now()
-      });
     }
-  } catch (e) {
-    console.log('User start sync error:', e.message);
+    addUserHistory(uidStr, 'Account Created', 0, 'Joined via /start', 0);
+  } else {
+    store.users[uidStr].username = msg.from.username || store.users[uidStr].username || '';
+    store.users[uidStr].firstName = firstName;
+    store.users[uidStr].updatedAt = Date.now();
+    saveStore();
   }
 
-  const maintParam = maintenanceEnabled ? '&maint=1' : '';
+  const maintParam = store.system.maintenanceEnabled ? '&maint=1' : '';
   const refQuery = startParam ? `&tgWebAppStartParam=${encodeURIComponent(startParam)}` : '';
   const webAppUrlWithVersion = `${BASE_APP_URL}?v=${appVersion}${maintParam}${refQuery}`;
   const welcomeText = `Welcome ${firstName} to the official ROL Mining app!\n\nTap the button below to launch the mini app and start mining:`;
@@ -203,10 +220,13 @@ bot.onText(/\/admin/, (msg) => {
   sendAdminPanel(msg.chat.id);
 });
 
-async function sendAdminPanel(chatId, messageId = null) {
-  await syncSystemAndStats();
-
-  const maintBadge = maintenanceEnabled ? 'مفعّل في التطبيق 🔴' : 'متوقف 🟢';
+function sendAdminPanel(chatId, messageId = null) {
+  const realUsers = getRealUsersList();
+  const totalUsersCount = realUsers.length;
+  const activeHoldersCount = realUsers.filter(([, u]) => Number(u.balance || 0) > 0).length;
+  const bannedUsers = getBannedSet();
+  const pendingWithdrawals = getPendingWithdrawalsList();
+  const maintBadge = store.system.maintenanceEnabled ? 'مفعّل في التطبيق 🔴' : 'متوقف 🟢';
 
   const text = `👑 *لوحة تحكم المشرف العليا (ROL Admin)*\n\n` +
                `👥 إجمالي المستخدمين الحقيقيين: *${totalUsersCount}*\n` +
@@ -214,7 +234,7 @@ async function sendAdminPanel(chatId, messageId = null) {
                `🚫 عدد المحظورين: *${bannedUsers.size}*\n` +
                `📥 طلبات السحب المعلقة: *${pendingWithdrawals.length}*\n` +
                `🛠️ صيانة التطبيق: *${maintBadge}*\n` +
-               `🧪 المختبرون المسموح لهم: *${allowedTesters.length}*\n\n` +
+               `🧪 المختبرون المسموح لهم: *${store.system.allowedTesters.length}*\n\n` +
                `اختر الإجراء المطلوب:`;
 
   const inline_keyboard = [
@@ -232,7 +252,7 @@ async function sendAdminPanel(chatId, messageId = null) {
     ],
     [
       {
-        text: maintenanceEnabled ? '🟢 إيقاف صيانة التطبيق' : '🔴 تفعيل صيانة التطبيق',
+        text: store.system.maintenanceEnabled ? '🟢 إيقاف صيانة التطبيق' : '🔴 تفعيل صيانة التطبيق',
         callback_data: 'admin_toggle_maintenance'
       },
       { text: '🧪 إضافة مختبر', callback_data: 'admin_add_tester' }
@@ -260,7 +280,7 @@ async function sendAdminPanel(chatId, messageId = null) {
   }
 }
 
-bot.on('callback_query', async (query) => {
+bot.on('callback_query', (query) => {
   const chatId = query.message.chat.id;
   const messageId = query.message.message_id;
   const data = query.data;
@@ -271,22 +291,17 @@ bot.on('callback_query', async (query) => {
   }
 
   if (data === 'admin_panel') {
-    await sendAdminPanel(chatId, messageId);
+    sendAdminPanel(chatId, messageId);
     bot.answerCallbackQuery(query.id);
   }
   else if (data === 'admin_toggle_maintenance') {
-    maintenanceEnabled = !maintenanceEnabled;
-    await firebaseRequest('PATCH', 'config/system', {
-      maintenanceEnabled,
-      maintenanceMessage,
-      allowedTesters,
-      updatedAt: Date.now()
-    }).catch(() => {});
+    store.system.maintenanceEnabled = !store.system.maintenanceEnabled;
+    saveStore();
     bot.answerCallbackQuery(query.id, {
-      text: maintenanceEnabled ? 'تم تفعيل وضع الصيانة في التطبيق 🔴' : 'تم إيقاف وضع الصيانة 🟢',
+      text: store.system.maintenanceEnabled ? 'تم تفعيل وضع الصيانة في التطبيق 🔴' : 'تم إيقاف وضع الصيانة 🟢',
       show_alert: true
     });
-    await sendAdminPanel(chatId, messageId);
+    sendAdminPanel(chatId, messageId);
   }
   else if (data === 'admin_add_tester') {
     adminInputState = 'tester';
@@ -309,27 +324,16 @@ bot.on('callback_query', async (query) => {
     bot.answerCallbackQuery(query.id);
   }
   else if (data === 'admin_do_reset') {
-    try {
-      const { resetCount, errorCount } = await resetAllBalancesInFirebase();
-      appVersion = Date.now();
-      pendingWithdrawals = [];
-      bot.answerCallbackQuery(query.id, {
-        text: `تم تصفير ${resetCount} حساب بنجاح! 🧹`,
-        show_alert: true
-      });
-      await sendAdminPanel(chatId, messageId);
-      if (errorCount > 0) {
-        bot.sendMessage(chatId, `⚠️ تعذر تصفير ${errorCount} حساب.`);
-      }
-    } catch (err) {
-      bot.answerCallbackQuery(query.id, {
-        text: `فشل التصفير: ${err.message}`,
-        show_alert: true
-      });
-    }
+    const resetCount = resetAllBalancesLocal();
+    appVersion = Date.now();
+    bot.answerCallbackQuery(query.id, {
+      text: `تم تصفير ${resetCount} حساب بنجاح! 🧹`,
+      show_alert: true
+    });
+    sendAdminPanel(chatId, messageId);
   }
   else if (data === 'admin_withdrawals') {
-    await syncSystemAndStats();
+    const pendingWithdrawals = getPendingWithdrawalsList();
     if (pendingWithdrawals.length === 0) {
       bot.editMessageText('لا توجد طلبات سحب معلقة حالياً.', {
         chat_id: chatId,
@@ -368,17 +372,23 @@ bot.on('callback_query', async (query) => {
   }
   else if (data.startsWith('approve_')) {
     const reqId = data.replace('approve_', '');
-    await firebaseRequest('PATCH', `withdrawals/${reqId}`, { status: 'approved', reviewedAt: Date.now() }).catch(() => {});
-    pendingWithdrawals = pendingWithdrawals.filter(r => r.id !== reqId);
+    if (store.withdrawals[reqId]) {
+      store.withdrawals[reqId].status = 'approved';
+      store.withdrawals[reqId].reviewedAt = Date.now();
+      saveStore();
+    }
     bot.answerCallbackQuery(query.id, { text: 'تمت الموافقة بنجاح! ✅', show_alert: true });
-    await sendAdminPanel(chatId, messageId);
+    sendAdminPanel(chatId, messageId);
   }
   else if (data.startsWith('reject_')) {
     const reqId = data.replace('reject_', '');
-    await firebaseRequest('PATCH', `withdrawals/${reqId}`, { status: 'rejected', reviewedAt: Date.now() }).catch(() => {});
-    pendingWithdrawals = pendingWithdrawals.filter(r => r.id !== reqId);
+    if (store.withdrawals[reqId]) {
+      store.withdrawals[reqId].status = 'rejected';
+      store.withdrawals[reqId].reviewedAt = Date.now();
+      saveStore();
+    }
     bot.answerCallbackQuery(query.id, { text: 'تم الرفض ومصادرة العملات نهائياً! 🚫', show_alert: true });
-    await sendAdminPanel(chatId, messageId);
+    sendAdminPanel(chatId, messageId);
   }
   else if (data === 'admin_ban') {
     adminInputState = 'ban';
@@ -391,24 +401,18 @@ bot.on('callback_query', async (query) => {
     bot.answerCallbackQuery(query.id);
   }
   else if (data === 'admin_real_users') {
-    await syncSystemAndStats();
-    let statsMsg = `👥 *إحصائيات المستخدمين الحقيقية:*\n\n`;
-    try {
-      const usersData = await firebaseRequest('GET', 'users');
-      const valid = Object.entries(usersData && typeof usersData === 'object' ? usersData : {})
-        .filter(([k, u]) => u && typeof u === 'object' && k !== 'guest_miner');
-      const totalSupplyInBot = valid.reduce((sum, [, u]) => sum + Number(u.balance || 0), 0);
-      const verifiedCount = valid.filter(([, u]) => Boolean(u.isVerified)).length;
-      const walletLinkedCount = valid.filter(([, u]) => Boolean(u.wallet)).length;
+    const valid = getRealUsersList();
+    const totalSupplyInBot = valid.reduce((sum, [, u]) => sum + Number(u.balance || 0), 0);
+    const verifiedCount = valid.filter(([, u]) => Boolean(u.isVerified)).length;
+    const walletLinkedCount = valid.filter(([, u]) => Boolean(u.wallet)).length;
 
-      statsMsg += `• إجمالي الحسابات المسجلة: *${valid.length}*\n` +
-                  `• حاملو رصيد ROL (> 0): *${valid.filter(([, u]) => Number(u.balance || 0) > 0).length}*\n` +
-                  `• الحسابات الموثّقة (0.04 GRAM): *${verifiedCount}*\n` +
-                  `• المحافظ المربوطة: *${walletLinkedCount}*\n` +
-                  `• إجمالي أرصدة ROL داخل البوت: *${Number(totalSupplyInBot.toFixed(2))} ROL*`;
-    } catch (e) {
-      statsMsg += `تعذر جلب البيانات حالياً.`;
-    }
+    const statsMsg = `👥 *إحصائيات المستخدمين الحقيقية:*\n\n` +
+                     `• إجمالي الحسابات المسجلة: *${valid.length}*\n` +
+                     `• حاملو رصيد ROL (> 0): *${valid.filter(([, u]) => Number(u.balance || 0) > 0).length}*\n` +
+                     `• الحسابات الموثّقة (0.04 GRAM): *${verifiedCount}*\n` +
+                     `• المحافظ المربوطة: *${walletLinkedCount}*\n` +
+                     `• إجمالي أرصدة ROL داخل البوت: *${Number(totalSupplyInBot.toFixed(2))} ROL*`;
+
     bot.editMessageText(statsMsg, {
       chat_id: chatId,
       message_id: messageId,
@@ -428,30 +432,25 @@ bot.on('callback_query', async (query) => {
   }
   else if (data === 'admin_top100') {
     let topText = `🏆 *أكبر 100 حامل لعملة ROL داخل البوت:*\n\n`;
-    try {
-      const usersData = await firebaseRequest('GET', 'users');
-      const list = Object.entries(usersData && typeof usersData === 'object' ? usersData : {})
-        .filter(([k, u]) => u && typeof u === 'object' && k !== 'guest_miner' && Number(u.balance || 0) > 0)
-        .map(([uId, u]) => ({
-          uid: uId,
-          username: u.username || '',
-          balance: Number(u.balance || 0),
-          verified: u.isVerified ? '✅' : '⏳'
-        }))
-        .sort((a, b) => b.balance - a.balance)
-        .slice(0, 100);
+    const list = getRealUsersList()
+      .filter(([, u]) => Number(u.balance || 0) > 0)
+      .map(([uId, u]) => ({
+        uid: uId,
+        username: u.username || '',
+        balance: Number(u.balance || 0),
+        verified: u.isVerified ? '✅' : '⏳'
+      }))
+      .sort((a, b) => b.balance - a.balance)
+      .slice(0, 100);
 
-      if (list.length === 0) {
-        topText += `لا يوجد حاملو عملة برصيد أكبر من 0 حالياً.`;
-      } else {
-        list.forEach((item, idx) => {
-          const medal = idx === 0 ? '🥇' : idx === 1 ? '🥈' : idx === 2 ? '🥉' : `${idx + 1}.`;
-          const nameLabel = item.username ? `@${item.username} (\`${item.uid}\`)` : `\`${item.uid}\``;
-          topText += `${medal} ${nameLabel} ${item.verified} — *${item.balance}* ROL\n`;
-        });
-      }
-    } catch (e) {
-      topText += `تعذر جلب القائمة حالياً.`;
+    if (list.length === 0) {
+      topText += `لا يوجد حاملو عملة برصيد أكبر من 0 حالياً.`;
+    } else {
+      list.forEach((item, idx) => {
+        const medal = idx === 0 ? '🥇' : idx === 1 ? '🥈' : idx === 2 ? '🥉' : `${idx + 1}.`;
+        const nameLabel = item.username ? `@${item.username} (\`${item.uid}\`)` : `\`${item.uid}\``;
+        topText += `${medal} ${nameLabel} ${item.verified} — *${item.balance}* ROL\n`;
+      });
     }
 
     if (topText.length > 3900) {
@@ -470,7 +469,7 @@ bot.on('callback_query', async (query) => {
   }
 });
 
-bot.on('message', async (msg) => {
+bot.on('message', (msg) => {
   if (!msg.from || msg.from.id !== ADMIN_ID || !msg.text || msg.text.startsWith('/')) return;
   if (!adminInputState) return;
 
@@ -482,89 +481,84 @@ bot.on('message', async (msg) => {
 
   const currentAction = adminInputState;
   adminInputState = null;
+  const strId = String(targetId);
 
   if (currentAction === 'ban') {
-    bannedUsers.add(targetId);
-    await firebaseRequest('PATCH', `users/${targetId}`, { banned: true, bannedAt: Date.now() }).catch(() => {});
-    bot.sendMessage(chatId, `✅ تم حظر المستخدم بنجاح: \`${targetId}\``, { parse_mode: 'Markdown' });
-    await sendAdminPanel(chatId);
-  } else if (currentAction === 'unban') {
-    bannedUsers.delete(targetId);
-    await firebaseRequest('PATCH', `users/${targetId}`, { banned: false, banReason: '' }).catch(() => {});
-    bot.sendMessage(chatId, `✅ تم فك حظر المستخدم: \`${targetId}\``, { parse_mode: 'Markdown' });
-    await sendAdminPanel(chatId);
-  } else if (currentAction === 'tester') {
-    const strId = String(targetId);
-    if (!allowedTesters.includes(strId)) allowedTesters.push(strId);
-    await firebaseRequest('PATCH', 'config/system', {
-      maintenanceEnabled,
-      maintenanceMessage,
-      allowedTesters,
-      updatedAt: Date.now()
-    }).catch(() => {});
-    bot.sendMessage(chatId, `🧪 تم إضافة المختبر بنجاح: \`${strId}\``, { parse_mode: 'Markdown' });
-    await sendAdminPanel(chatId);
-  } else if (currentAction === 'history') {
-    const strId = String(targetId);
-    try {
-      const userData = await firebaseRequest('GET', `users/${strId}`);
-      if (!userData || typeof userData !== 'object') {
-        await bot.sendMessage(chatId, `⚠️ لم يتم العثور على مستخدم بالمعرف \`${strId}\`.`, { parse_mode: 'Markdown' });
-        return await sendAdminPanel(chatId);
-      }
-
-      const uname = userData.username ? `@${userData.username}` : 'بدون يوزر';
-      const bal = Number(userData.balance || 0);
-      const onChain = Number(userData.onChainWalletROL || 0);
-      const refs = Number(userData.refCount || 0);
-      const refEarn = Number(userData.refEarn || 0);
-      const verifiedTxt = userData.isVerified ? 'موثّق ✅' : 'غير موثّق ❌';
-      const walletTxt = userData.wallet ? `\`${userData.wallet}\`` : 'غير مربوطة';
-      const tasksDone = Array.isArray(userData.completedTasks) ? userData.completedTasks.length : 0;
-
-      let report = `📜 *سجل المستخدم (User History):*\n\n` +
-                   `👤 المعرف: \`${strId}\` (${uname})\n` +
-                   `💰 الرصيد الحالي في البوت: *${bal} ROL*\n` +
-                   `💎 رصيد المحفظة على الشبكة: *${onChain} ROL*\n` +
-                   `🛡️ حالة التوثيق: *${verifiedTxt}*\n` +
-                   `🏦 المحفظة: ${walletTxt}\n` +
-                   `👥 الإحالات المؤكدة: *${refs}* (أرباحها: *${refEarn} ROL*)\n` +
-                   `✅ المهام المكتملة: *${tasksDone}*\n\n` +
-                   `📊 *آخر العمليات ومصادر جمع العملات:*\n`;
-
-      const histObj = userData.history && typeof userData.history === 'object' ? userData.history : {};
-      const entries = Object.values(histObj)
-        .filter(item => item && typeof item === 'object')
-        .sort((a, b) => Number(b.timestamp || 0) - Number(a.timestamp || 0))
-        .slice(0, 25);
-
-      if (entries.length === 0) {
-        report += `_لا توجد حركات مسجلة في السجل التفصيلي بعد (سيتم تسجيل كل عملية تعدين، سبين، مهمة، حضور يومي، أو إحالة تلقائياً)._`;
-      } else {
-        entries.forEach((ev, idx) => {
-          const dt = ev.timestamp ? new Date(ev.timestamp).toISOString().replace('T', ' ').slice(0, 16) : '-';
-          const sign = Number(ev.amount || 0) >= 0 ? '+' : '';
-          const det = ev.details ? ` (${ev.details})` : '';
-          report += `${idx + 1}. *${ev.source || 'عملية'}*: *${sign}${ev.amount} ROL*${det}\n   🕒 ${dt} UTC\n`;
-        });
-      }
-
-      if (report.length > 3950) {
-        report = report.slice(0, 3900) + '\n...';
-      }
-
-      await bot.sendMessage(chatId, report, { parse_mode: 'Markdown' });
-    } catch (e) {
-      await bot.sendMessage(chatId, `⚠️ تعذر جلب سجل المستخدم: ${e.message}`);
+    if (!store.users[strId]) {
+      store.users[strId] = { uid: strId, balance: 0, vip: 1, history: [], createdAt: Date.now() };
     }
-    await sendAdminPanel(chatId);
+    store.users[strId].banned = true;
+    store.users[strId].bannedAt = Date.now();
+    saveStore();
+    bot.sendMessage(chatId, `✅ تم حظر المستخدم بنجاح: \`${targetId}\``, { parse_mode: 'Markdown' });
+    sendAdminPanel(chatId);
+  } else if (currentAction === 'unban') {
+    if (store.users[strId]) {
+      store.users[strId].banned = false;
+      saveStore();
+    }
+    bot.sendMessage(chatId, `✅ تم فك حظر المستخدم: \`${targetId}\``, { parse_mode: 'Markdown' });
+    sendAdminPanel(chatId);
+  } else if (currentAction === 'tester') {
+    if (!store.system.allowedTesters.includes(strId)) {
+      store.system.allowedTesters.push(strId);
+      saveStore();
+    }
+    bot.sendMessage(chatId, `🧪 تم إضافة المختبر بنجاح: \`${strId}\``, { parse_mode: 'Markdown' });
+    sendAdminPanel(chatId);
+  } else if (currentAction === 'history') {
+    const userData = store.users[strId];
+    if (!userData || typeof userData !== 'object') {
+      bot.sendMessage(chatId, `⚠️ لم يتم العثور على مستخدم بالمعرف \`${strId}\`.`, { parse_mode: 'Markdown' });
+      return sendAdminPanel(chatId);
+    }
+
+    const uname = userData.username ? `@${userData.username}` : 'بدون يوزر';
+    const bal = Number(userData.balance || 0);
+    const onChain = Number(userData.onChainWalletROL || 0);
+    const refs = Number(userData.refCount || 0);
+    const refEarn = Number(userData.refEarn || 0);
+    const verifiedTxt = userData.isVerified ? 'موثّق ✅' : 'غير موثّق ❌';
+    const walletTxt = userData.wallet ? `\`${userData.wallet}\`` : 'غير مربوطة';
+    const tasksDone = Array.isArray(userData.completedTasks) ? userData.completedTasks.length : 0;
+
+    let report = `📜 *سجل المستخدم (User History):*\n\n` +
+                 `👤 المعرف: \`${strId}\` (${uname})\n` +
+                 `💰 الرصيد الحالي في البوت: *${bal} ROL*\n` +
+                 `💎 رصيد المحفظة على الشبكة: *${onChain} ROL*\n` +
+                 `🛡️ حالة التوثيق: *${verifiedTxt}*\n` +
+                 `🏦 المحفظة: ${walletTxt}\n` +
+                 `👥 الإحالات المؤكدة: *${refs}* (أرباحها: *${refEarn} ROL*)\n` +
+                 `✅ المهام المكتملة: *${tasksDone}*\n\n` +
+                 `📊 *آخر العمليات ومصادر جمع العملات:*\n`;
+
+    const entries = Array.isArray(userData.history)
+      ? [...userData.history].sort((a, b) => Number(b.timestamp || 0) - Number(a.timestamp || 0)).slice(0, 25)
+      : [];
+
+    if (entries.length === 0) {
+      report += `_لا توجد حركات مسجلة في السجل التفصيلي بعد._`;
+    } else {
+      entries.forEach((ev, idx) => {
+        const dt = ev.timestamp ? new Date(ev.timestamp).toISOString().replace('T', ' ').slice(0, 16) : '-';
+        const sign = Number(ev.amount || 0) >= 0 ? '+' : '';
+        const det = ev.details ? ` (${ev.details})` : '';
+        report += `${idx + 1}. *${ev.source || 'عملية'}*: *${sign}${ev.amount} ROL*${det}\n   🕒 ${dt} UTC\n`;
+      });
+    }
+
+    if (report.length > 3950) {
+      report = report.slice(0, 3900) + '\n...';
+    }
+
+    bot.sendMessage(chatId, report, { parse_mode: 'Markdown' }).then(() => sendAdminPanel(chatId));
   }
 });
 
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
   if (req.method === 'OPTIONS') {
@@ -574,6 +568,7 @@ http.createServer((req, res) => {
   }
 
   const parsedUrl = url.parse(req.url, true);
+
   if (req.method === 'GET' && parsedUrl.pathname === '/api/check-channel') {
     const targetUserId = parsedUrl.query?.userId || '';
     isUserSubscribedToChannel(targetUserId)
@@ -585,6 +580,85 @@ http.createServer((req, res) => {
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
         res.end(JSON.stringify({ ok: false, joined: false }));
       });
+    return;
+  }
+
+  if (req.method === 'GET' && parsedUrl.pathname === '/api/user') {
+    const uId = String(parsedUrl.query?.uid || '').trim();
+    const userObj = uId && store.users[uId] ? store.users[uId] : null;
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify({
+      ok: true,
+      user: userObj,
+      system: store.system,
+      appVersion
+    }));
+    return;
+  }
+
+  if (req.method === 'POST' && parsedUrl.pathname === '/api/sync-user') {
+    let body = '';
+    req.on('data', chunk => { body += chunk; });
+    req.on('end', () => {
+      try {
+        const payload = JSON.parse(body || '{}');
+        const uId = String(payload.uid || '').trim();
+        if (!uId || uId === 'guest_miner') {
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          return res.end(JSON.stringify({ ok: true }));
+        }
+        const existing = store.users[uId] || { history: [], createdAt: Date.now() };
+        store.users[uId] = {
+          ...existing,
+          ...payload,
+          uid: uId,
+          history: Array.isArray(existing.history) ? existing.history : [],
+          updatedAt: Date.now()
+        };
+        if (payload.historyEntry && typeof payload.historyEntry === 'object') {
+          store.users[uId].history.push({
+            ...payload.historyEntry,
+            timestamp: payload.historyEntry.timestamp || Date.now()
+          });
+          if (store.users[uId].history.length > 100) {
+            store.users[uId].history = store.users[uId].history.slice(-100);
+          }
+        }
+        saveStore();
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: true }));
+      } catch (e) {
+        res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, error: e.message }));
+      }
+    });
+    return;
+  }
+
+  if (req.method === 'POST' && parsedUrl.pathname === '/api/withdraw') {
+    let body = '';
+    req.on('data', chunk => { body += chunk; });
+    req.on('end', () => {
+      try {
+        const wData = JSON.parse(body || '{}');
+        const reqId = String(wData.id || `wd_${Date.now()}`);
+        store.withdrawals[reqId] = {
+          ...wData,
+          id: reqId,
+          status: 'pending',
+          createdAt: wData.createdAt || Date.now()
+        };
+        if (wData.uid) {
+          addUserHistory(wData.uid, 'Withdrawal Request', -Number(wData.amount || 0), `Net: ${wData.netAmount || 0} ROL`, 0);
+        }
+        saveStore();
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: true }));
+      } catch (e) {
+        res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, error: e.message }));
+      }
+    });
     return;
   }
 
