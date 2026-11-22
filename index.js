@@ -9,6 +9,7 @@ const BASE_APP_URL = process.env.WEBAPP_URL || 'https://fruit-titan.github.io/fr
 const REQUIRED_CHANNEL_USERNAME = process.env.REQUIRED_CHANNEL || 'ROL_TOKN';
 const ADMIN_ID = 1932161126;
 const DATA_FILE = path.join(__dirname, 'rol_bot_data.json');
+const CONTEST_DURATION_MS = 7 * 24 * 60 * 60 * 1000;
 
 const bot = new TelegramBot(token, { polling: true });
 
@@ -16,6 +17,10 @@ let store = {
   users: {},
   withdrawals: {},
   paidTasks: [],
+  contest: {
+    startedAt: Date.now(),
+    durationMs: CONTEST_DURATION_MS
+  },
   system: {
     maintenanceEnabled: false,
     maintenanceMessage: 'نقوم حالياً بتحديث النظام وتحسين الأداء. سنعود للعمل قريباً.',
@@ -32,10 +37,16 @@ function loadStore() {
       const raw = fs.readFileSync(DATA_FILE, 'utf8');
       const parsed = JSON.parse(raw);
       if (parsed && typeof parsed === 'object') {
+        const startedAt = Number(parsed.contest?.startedAt || Date.now());
+        const durationMs = Number(parsed.contest?.durationMs || CONTEST_DURATION_MS);
         store = {
           users: parsed.users && typeof parsed.users === 'object' ? parsed.users : {},
           withdrawals: parsed.withdrawals && typeof parsed.withdrawals === 'object' ? parsed.withdrawals : {},
           paidTasks: Array.isArray(parsed.paidTasks) ? parsed.paidTasks : [],
+          contest: {
+            startedAt: startedAt > 0 ? startedAt : Date.now(),
+            durationMs: durationMs > 0 ? durationMs : CONTEST_DURATION_MS
+          },
           system: {
             maintenanceEnabled: Boolean(parsed.system?.maintenanceEnabled),
             maintenanceMessage: parsed.system?.maintenanceMessage || store.system.maintenanceMessage,
@@ -55,6 +66,28 @@ function saveStore() {
   } catch (e) {
     console.log('Save store notice:', e.message);
   }
+}
+
+function getContestState() {
+  if (!store.contest || !store.contest.startedAt) {
+    store.contest = { startedAt: Date.now(), durationMs: CONTEST_DURATION_MS };
+    saveStore();
+  }
+  const now = Date.now();
+  const duration = Number(store.contest.durationMs || CONTEST_DURATION_MS);
+  let elapsed = now - Number(store.contest.startedAt);
+  while (elapsed >= duration) {
+    store.contest.startedAt = Number(store.contest.startedAt) + duration;
+    elapsed = now - Number(store.contest.startedAt);
+    saveStore();
+  }
+  const endsAt = Number(store.contest.startedAt) + duration;
+  const remainingMs = Math.max(0, endsAt - now);
+  return {
+    startedAt: Number(store.contest.startedAt),
+    endsAt,
+    remainingMs
+  };
 }
 
 function ensureUserRecord(userId, meta = {}) {
@@ -202,6 +235,27 @@ function getRealUsersList() {
     .filter(([k, u]) => u && typeof u === 'object' && k !== 'guest_miner');
 }
 
+function getTop20VerifiedReferrers() {
+  return getRealUsersList()
+    .filter(([, u]) => !u.banned)
+    .map(([uId, u]) => {
+      const verifiedFromList = Array.isArray(u.referralsList)
+        ? u.referralsList.filter(r => Boolean(r && r.verified)).length
+        : 0;
+      const verifiedCount = Math.max(Number(u.refCount || 0), verifiedFromList);
+      return {
+        uid: uId,
+        firstName: u.firstName || 'Miner',
+        username: u.username || '',
+        photoUrl: u.photoUrl || '',
+        verifiedReferrals: verifiedCount
+      };
+    })
+    .filter(item => item.verifiedReferrals > 0)
+    .sort((a, b) => b.verifiedReferrals - a.verifiedReferrals)
+    .slice(0, 20);
+}
+
 function getBannedSet() {
   return new Set(
     getRealUsersList()
@@ -235,6 +289,7 @@ function resetAllBalancesLocal() {
 }
 
 loadStore();
+getContestState();
 
 bot.on('polling_error', (err) => {
   console.log('Polling error:', err.message);
@@ -547,7 +602,7 @@ bot.on('callback_query', (query) => {
     const statsMsg = `👥 *إحصائيات المستخدمين الحقيقية:*\n\n` +
                      `• إجمالي الحسابات المسجلة: *${valid.length}*\n` +
                      `• حاملو رصيد ROL (> 0): *${valid.filter(([, u]) => Number(u.balance || 0) > 0).length}*\n` +
-                     `• الحسابات الموثّقة (0.04 GRAM): *${verifiedCount}*\n` +
+                     `• الحسابات الموثّقة (0.05 GRAM): *${verifiedCount}*\n` +
                      `• المحافظ المربوطة: *${walletLinkedCount}*\n` +
                      `• إجمالي أرصدة ROL داخل البوت: *${Number(totalSupplyInBot.toFixed(2))} ROL*`;
 
@@ -706,6 +761,25 @@ http.createServer((req, res) => {
   }
 
   const parsedUrl = url.parse(req.url, true);
+
+  if (req.method === 'GET' && parsedUrl.pathname === '/api/top-referrals') {
+    const contest = getContestState();
+    const top20 = getTop20VerifiedReferrers();
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify({
+      ok: true,
+      top20,
+      contest,
+      prizes: [
+        { rank: 1, reward: '10 GRAM' },
+        { rank: 2, reward: '5 GRAM' },
+        { rank: 3, reward: '3 GRAM' },
+        { rank: 4, reward: '1 GRAM' },
+        { rank: 5, reward: '1 GRAM' }
+      ]
+    }));
+    return;
+  }
 
   if (req.method === 'GET' && parsedUrl.pathname === '/api/check-channel') {
     const targetUserId = parsedUrl.query?.userId || '';
@@ -900,6 +974,7 @@ http.createServer((req, res) => {
       ok: true,
       user: userObj,
       system: store.system,
+      contest: getContestState(),
       appVersion
     }));
     return;
