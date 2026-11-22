@@ -333,7 +333,10 @@ function getTop20VerifiedReferrers() {
           if (r && r.verified && r.uid) refSet.add(String(r.uid));
         }
       }
-      const verifiedCount = Math.max(Number(u.refCount || 0), refSet.size);
+      const historyVerifiedCount = Array.isArray(u.history)
+        ? u.history.filter(h => h && String(h.source || '').toLowerCase().includes('verified referral')).length
+        : 0;
+      const verifiedCount = Math.max(Number(u.refCount || 0), refSet.size, historyVerifiedCount);
       const avatarEndpoint = `${BOT_BASE_URL}/api/avatar?uid=${encodeURIComponent(String(uId))}`;
       return {
         uid: uId,
