@@ -25,6 +25,7 @@ let store = {
   users: {},
   withdrawals: {},
   paidTasks: [],
+  topLeaderboard: [],
   contest: {
     startedAt: Date.now(),
     durationMs: CONTEST_DURATION_MS
@@ -52,6 +53,7 @@ function loadStore() {
           users: parsed.users && typeof parsed.users === 'object' ? parsed.users : {},
           withdrawals: parsed.withdrawals && typeof parsed.withdrawals === 'object' ? parsed.withdrawals : {},
           paidTasks: Array.isArray(parsed.paidTasks) ? parsed.paidTasks : [],
+          topLeaderboard: Array.isArray(parsed.topLeaderboard) ? parsed.topLeaderboard : [],
           contest: {
             startedAt: startedAt > 0 ? startedAt : Date.now(),
             durationMs: durationMs > 0 ? durationMs : CONTEST_DURATION_MS
@@ -187,6 +189,7 @@ function registerReferralLink(referrerId, invitedId, invitedMeta = {}) {
   } else {
     refUser.referralsList.push(entry);
   }
+  syncTopLeaderboardPersistent();
   saveStore();
 }
 
@@ -216,6 +219,7 @@ function confirmReferralForReferrer(referrerId, invitedId, invitedMeta = {}) {
       addUserHistory(refKey, 'Verified Referral', 60, `From user ${invKey}`, refUser.balance);
     }
   }
+  syncTopLeaderboardPersistent();
   saveStore();
   return true;
 }
@@ -310,7 +314,7 @@ function getRealUsersList() {
     .filter(([k, u]) => u && typeof u === 'object' && k !== 'guest_miner');
 }
 
-function getTop20VerifiedReferrers() {
+function syncTopLeaderboardPersistent() {
   const realUsers = getRealUsersList();
   const verifiedByReferrer = new Map();
 
@@ -324,31 +328,55 @@ function getTop20VerifiedReferrers() {
     }
   }
 
-  return realUsers
-    .filter(([, u]) => !u.banned)
-    .map(([uId, u]) => {
-      const refSet = verifiedByReferrer.get(String(uId)) || new Set();
-      if (Array.isArray(u.referralsList)) {
-        for (const r of u.referralsList) {
-          if (r && r.verified && r.uid) refSet.add(String(r.uid));
-        }
+  const mapByUid = new Map();
+  for (const prev of (Array.isArray(store.topLeaderboard) ? store.topLeaderboard : [])) {
+    if (prev && prev.uid) {
+      mapByUid.set(String(prev.uid), {
+        uid: String(prev.uid),
+        firstName: prev.firstName || 'Miner',
+        username: prev.username || '',
+        photoUrl: `${BOT_BASE_URL}/api/avatar?uid=${encodeURIComponent(String(prev.uid))}`,
+        verifiedReferrals: Number(prev.verifiedReferrals || 0)
+      });
+    }
+  }
+
+  for (const [uId, u] of realUsers) {
+    if (!u || u.banned) continue;
+    const refSet = verifiedByReferrer.get(String(uId)) || new Set();
+    if (Array.isArray(u.referralsList)) {
+      for (const r of u.referralsList) {
+        if (r && r.verified && r.uid) refSet.add(String(r.uid));
       }
-      const historyVerifiedCount = Array.isArray(u.history)
-        ? u.history.filter(h => h && String(h.source || '').toLowerCase().includes('verified referral')).length
-        : 0;
-      const verifiedCount = Math.max(Number(u.refCount || 0), refSet.size, historyVerifiedCount);
-      const avatarEndpoint = `${BOT_BASE_URL}/api/avatar?uid=${encodeURIComponent(String(uId))}`;
-      return {
-        uid: uId,
-        firstName: u.firstName || 'Miner',
-        username: u.username || '',
-        photoUrl: avatarEndpoint,
-        verifiedReferrals: verifiedCount
-      };
-    })
-    .filter(item => item.verifiedReferrals > 0)
-    .sort((a, b) => b.verifiedReferrals - a.verifiedReferrals)
+    }
+    const historyVerifiedCount = Array.isArray(u.history)
+      ? u.history.filter(h => h && String(h.source || '').toLowerCase().includes('verified referral')).length
+      : 0;
+    const computedCount = Math.max(Number(u.refCount || 0), refSet.size, historyVerifiedCount);
+    const existingEntry = mapByUid.get(String(uId));
+    const finalCount = Math.max(computedCount, Number(existingEntry?.verifiedReferrals || 0));
+
+    if (finalCount > 0) {
+      mapByUid.set(String(uId), {
+        uid: String(uId),
+        firstName: u.firstName || existingEntry?.firstName || 'Miner',
+        username: u.username || existingEntry?.username || '',
+        photoUrl: `${BOT_BASE_URL}/api/avatar?uid=${encodeURIComponent(String(uId))}`,
+        verifiedReferrals: finalCount
+      });
+    }
+  }
+
+  store.topLeaderboard = Array.from(mapByUid.values())
+    .filter(item => Number(item.verifiedReferrals || 0) > 0)
+    .sort((a, b) => Number(b.verifiedReferrals || 0) - Number(a.verifiedReferrals || 0))
     .slice(0, 20);
+
+  return store.topLeaderboard;
+}
+
+function getTop20VerifiedReferrers() {
+  return syncTopLeaderboardPersistent();
 }
 
 function getBannedSet() {
@@ -385,6 +413,7 @@ function resetAllBalancesLocal() {
 
 loadStore();
 getContestState();
+syncTopLeaderboardPersistent();
 
 bot.on('polling_error', (err) => {
   console.log('Polling error:', err.message);
@@ -1139,6 +1168,7 @@ http.createServer((req, res) => {
             store.users[uId].history = store.users[uId].history.slice(-100);
           }
         }
+        syncTopLeaderboardPersistent();
         saveStore();
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
         res.end(JSON.stringify({ ok: true }));
