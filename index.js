@@ -12,7 +12,13 @@ const ADMIN_ID = 1932161126;
 const DATA_FILE = path.join(__dirname, 'rol_bot_data.json');
 const CONTEST_DURATION_MS = 7 * 24 * 60 * 60 * 1000;
 
-const bot = new TelegramBot(token, { polling: true });
+const bot = new TelegramBot(token, {
+  polling: {
+    interval: 300,
+    autoStart: true,
+    params: { timeout: 10 }
+  }
+});
 
 let store = {
   users: {},
@@ -31,7 +37,7 @@ let store = {
 
 let adminInputState = null; // 'ban' | 'unban' | 'tester' | 'history'
 let appVersion = Date.now();
-const avatarCache = new Map(); // uid -> { buffer, contentType, expiresAt }
+const avatarCache = new Map();
 
 function loadStore() {
   try {
@@ -64,9 +70,15 @@ function loadStore() {
 
 function saveStore() {
   try {
-    fs.writeFileSync(DATA_FILE, JSON.stringify(store, null, 2), 'utf8');
+    const tmpFile = `${DATA_FILE}.tmp`;
+    fs.writeFileSync(tmpFile, JSON.stringify(store), 'utf8');
+    fs.renameSync(tmpFile, DATA_FILE);
   } catch (e) {
-    console.log('Save store notice:', e.message);
+    try {
+      fs.writeFileSync(DATA_FILE, JSON.stringify(store), 'utf8');
+    } catch (err2) {
+      console.log('Save store notice:', err2.message);
+    }
   }
 }
 
@@ -78,11 +90,13 @@ function getContestState() {
   const now = Date.now();
   const duration = Number(store.contest.durationMs || CONTEST_DURATION_MS);
   let elapsed = now - Number(store.contest.startedAt);
+  let changed = false;
   while (elapsed >= duration) {
     store.contest.startedAt = Number(store.contest.startedAt) + duration;
     elapsed = now - Number(store.contest.startedAt);
-    saveStore();
+    changed = true;
   }
+  if (changed) saveStore();
   const endsAt = Number(store.contest.startedAt) + duration;
   const remainingMs = Math.max(0, endsAt - now);
   return {
@@ -266,9 +280,6 @@ async function serveUserAvatarImage(userId, res) {
       contentType,
       expiresAt: Date.now() + (30 * 60 * 1000)
     });
-    if (store.users[key]) {
-      store.users[key].photoUrl = `/api/avatar?uid=${encodeURIComponent(key)}`;
-    }
     res.writeHead(200, {
       'Content-Type': contentType,
       'Cache-Control': 'public, max-age=1800'
@@ -375,7 +386,12 @@ bot.on('polling_error', (err) => {
   console.log('Polling error:', err.message);
 });
 
-bot.onText(/\/start(.*)/, async (msg, match) => {
+bot.on('webhook_error', (err) => {
+  console.log('Webhook error:', err.message);
+});
+
+bot.onText(/\/start(.*)/, (msg, match) => {
+  if (!msg || !msg.from) return;
   const chatId = msg.chat.id;
   const userId = msg.from.id;
   const firstName = msg.from.first_name || 'Miner';
@@ -384,7 +400,7 @@ bot.onText(/\/start(.*)/, async (msg, match) => {
 
   const bannedUsers = getBannedSet();
   if (bannedUsers.has(userId)) {
-    return bot.sendMessage(chatId, '🚫 Sorry, your account has been banned from using this bot.');
+    return bot.sendMessage(chatId, '🚫 Sorry, your account has been banned from using this bot.').catch(() => {});
   }
 
   const uidStr = String(userId);
@@ -438,12 +454,13 @@ bot.onText(/\/start(.*)/, async (msg, match) => {
   bot.sendMessage(chatId, welcomeText, {
     parse_mode: 'Markdown',
     reply_markup: { inline_keyboard: keyboard }
-  });
+  }).catch((e) => console.log('sendMessage /start err:', e.message));
 });
 
 bot.onText(/\/admin/, (msg) => {
+  if (!msg || !msg.from) return;
   if (msg.from.id !== ADMIN_ID) {
-    return bot.sendMessage(msg.chat.id, '⛔ هذا الأمر مخصص لمالك البوت فقط.');
+    return bot.sendMessage(msg.chat.id, '⛔ هذا الأمر مخصص لمالك البوت فقط.').catch(() => {});
   }
   sendAdminPanel(msg.chat.id);
 });
@@ -508,32 +525,33 @@ function sendAdminPanel(chatId, messageId = null) {
     bot.sendMessage(chatId, text, {
       parse_mode: 'Markdown',
       reply_markup: { inline_keyboard }
-    });
+    }).catch(() => {});
   }
 }
 
 bot.on('callback_query', (query) => {
+  if (!query || !query.message || !query.from) return;
   const chatId = query.message.chat.id;
   const messageId = query.message.message_id;
   const data = query.data;
   const userId = query.from.id;
 
   if (userId !== ADMIN_ID) {
-    return bot.answerCallbackQuery(query.id, { text: 'غير مصرح لك!', show_alert: true });
+    return bot.answerCallbackQuery(query.id, { text: 'غير مصرح لك!', show_alert: true }).catch(() => {});
   }
 
   if (data === 'admin_panel') {
     sendAdminPanel(chatId, messageId);
-    bot.answerCallbackQuery(query.id);
+    bot.answerCallbackQuery(query.id).catch(() => {});
   }
   else if (data === 'admin_backup') {
     saveStore();
     if (fs.existsSync(DATA_FILE)) {
-      bot.sendDocument(chatId, DATA_FILE, {
+      bot.sendDocument(chatId, fs.createReadStream(DATA_FILE), {
         caption: '💾 نسخة احتياطية لبيانات البوت والمستخدمين والمهام'
-      }).catch(() => {});
+      }, { filename: 'rol_bot_data.json' }).catch(() => {});
     }
-    bot.answerCallbackQuery(query.id, { text: 'تم إرسال النسخة الاحتياطية 💾', show_alert: true });
+    bot.answerCallbackQuery(query.id, { text: 'تم إرسال النسخة الاحتياطية 💾', show_alert: true }).catch(() => {});
   }
   else if (data === 'admin_tasks_report') {
     const tasksList = Array.isArray(store.paidTasks) ? store.paidTasks : [];
@@ -565,7 +583,7 @@ bot.on('callback_query', (query) => {
         inline_keyboard: [[{ text: '🔙 رجوع للوحة التحكم', callback_data: 'admin_panel' }]]
       }
     }).catch(() => {});
-    bot.answerCallbackQuery(query.id);
+    bot.answerCallbackQuery(query.id).catch(() => {});
   }
   else if (data === 'admin_toggle_maintenance') {
     store.system.maintenanceEnabled = !store.system.maintenanceEnabled;
@@ -573,13 +591,13 @@ bot.on('callback_query', (query) => {
     bot.answerCallbackQuery(query.id, {
       text: store.system.maintenanceEnabled ? 'تم تفعيل وضع الصيانة في التطبيق 🔴' : 'تم إيقاف وضع الصيانة 🟢',
       show_alert: true
-    });
+    }).catch(() => {});
     sendAdminPanel(chatId, messageId);
   }
   else if (data === 'admin_add_tester') {
     adminInputState = 'tester';
-    bot.sendMessage(chatId, 'أرسل الآن Telegram ID الخاص بالمختبر للسماح له بدخول التطبيق أثناء الصيانة:');
-    bot.answerCallbackQuery(query.id);
+    bot.sendMessage(chatId, 'أرسل الآن Telegram ID الخاص بالمختبر للسماح له بدخول التطبيق أثناء الصيانة:').catch(() => {});
+    bot.answerCallbackQuery(query.id).catch(() => {});
   }
   else if (data === 'admin_confirm_reset') {
     const confirmText = `⚠️ *تحذير خطير: تصفير الأرصدة*\n\n` +
@@ -594,7 +612,7 @@ bot.on('callback_query', (query) => {
       parse_mode: 'Markdown',
       reply_markup: { inline_keyboard: buttons }
     }).catch(() => {});
-    bot.answerCallbackQuery(query.id);
+    bot.answerCallbackQuery(query.id).catch(() => {});
   }
   else if (data === 'admin_do_reset') {
     const resetCount = resetAllBalancesLocal();
@@ -602,7 +620,7 @@ bot.on('callback_query', (query) => {
     bot.answerCallbackQuery(query.id, {
       text: `تم تصفير ${resetCount} حساب بنجاح! 🧹`,
       show_alert: true
-    });
+    }).catch(() => {});
     sendAdminPanel(chatId, messageId);
   }
   else if (data === 'admin_withdrawals') {
@@ -615,7 +633,7 @@ bot.on('callback_query', (query) => {
           inline_keyboard: [[{ text: '🔙 رجوع للوحة التحكم', callback_data: 'admin_panel' }]]
         }
       }).catch(() => {});
-      return bot.answerCallbackQuery(query.id);
+      return bot.answerCallbackQuery(query.id).catch(() => {});
     }
 
     const req = pendingWithdrawals[0];
@@ -641,7 +659,7 @@ bot.on('callback_query', (query) => {
       parse_mode: 'Markdown',
       reply_markup: { inline_keyboard: buttons }
     }).catch(() => {});
-    bot.answerCallbackQuery(query.id);
+    bot.answerCallbackQuery(query.id).catch(() => {});
   }
   else if (data.startsWith('approve_')) {
     const reqId = data.replace('approve_', '');
@@ -650,7 +668,7 @@ bot.on('callback_query', (query) => {
       store.withdrawals[reqId].reviewedAt = Date.now();
       saveStore();
     }
-    bot.answerCallbackQuery(query.id, { text: 'تمت الموافقة بنجاح! ✅', show_alert: true });
+    bot.answerCallbackQuery(query.id, { text: 'تمت الموافقة بنجاح! ✅', show_alert: true }).catch(() => {});
     sendAdminPanel(chatId, messageId);
   }
   else if (data.startsWith('reject_')) {
@@ -660,18 +678,18 @@ bot.on('callback_query', (query) => {
       store.withdrawals[reqId].reviewedAt = Date.now();
       saveStore();
     }
-    bot.answerCallbackQuery(query.id, { text: 'تم الرفض ومصادرة العملات نهائياً! 🚫', show_alert: true });
+    bot.answerCallbackQuery(query.id, { text: 'تم الرفض ومصادرة العملات نهائياً! 🚫', show_alert: true }).catch(() => {});
     sendAdminPanel(chatId, messageId);
   }
   else if (data === 'admin_ban') {
     adminInputState = 'ban';
-    bot.sendMessage(chatId, 'أرسل الآن الـ ID الخاص بالحساب المراد حظره:');
-    bot.answerCallbackQuery(query.id);
+    bot.sendMessage(chatId, 'أرسل الآن الـ ID الخاص بالحساب المراد حظره:').catch(() => {});
+    bot.answerCallbackQuery(query.id).catch(() => {});
   }
   else if (data === 'admin_unban') {
     adminInputState = 'unban';
-    bot.sendMessage(chatId, 'أرسل الآن الـ ID الخاص بالحساب المراد فك حظره:');
-    bot.answerCallbackQuery(query.id);
+    bot.sendMessage(chatId, 'أرسل الآن الـ ID الخاص بالحساب المراد فك حظره:').catch(() => {});
+    bot.answerCallbackQuery(query.id).catch(() => {});
   }
   else if (data === 'admin_real_users') {
     const valid = getRealUsersList();
@@ -694,14 +712,14 @@ bot.on('callback_query', (query) => {
         inline_keyboard: [[{ text: '🔙 رجوع للوحة التحكم', callback_data: 'admin_panel' }]]
       }
     }).catch(() => {});
-    bot.answerCallbackQuery(query.id);
+    bot.answerCallbackQuery(query.id).catch(() => {});
   }
   else if (data === 'admin_user_history') {
     adminInputState = 'history';
     bot.sendMessage(chatId, '📜 أرسل الآن *Telegram ID* الخاص بالمستخدم لعرض سجل جمع عملاته بالتفصيل (History):', {
       parse_mode: 'Markdown'
-    });
-    bot.answerCallbackQuery(query.id);
+    }).catch(() => {});
+    bot.answerCallbackQuery(query.id).catch(() => {});
   }
   else if (data === 'admin_top100') {
     let topText = `🏆 *أكبر 100 حامل لعملة ROL داخل البوت:*\n\n`;
@@ -738,7 +756,7 @@ bot.on('callback_query', (query) => {
         inline_keyboard: [[{ text: '🔙 رجوع للوحة التحكم', callback_data: 'admin_panel' }]]
       }
     }).catch(() => {});
-    bot.answerCallbackQuery(query.id);
+    bot.answerCallbackQuery(query.id).catch(() => {});
   }
 });
 
@@ -749,7 +767,7 @@ bot.on('message', (msg) => {
   const chatId = msg.chat.id;
   const targetId = parseInt(msg.text.trim(), 10);
   if (isNaN(targetId)) {
-    return bot.sendMessage(chatId, '⚠️ يرجى إرسال رقم ID صحيح.');
+    return bot.sendMessage(chatId, '⚠️ يرجى إرسال رقم ID صحيح.').catch(() => {});
   }
 
   const currentAction = adminInputState;
@@ -763,26 +781,26 @@ bot.on('message', (msg) => {
       u.bannedAt = Date.now();
       saveStore();
     }
-    bot.sendMessage(chatId, `✅ تم حظر المستخدم بنجاح: \`${targetId}\``, { parse_mode: 'Markdown' });
+    bot.sendMessage(chatId, `✅ تم حظر المستخدم بنجاح: \`${targetId}\``, { parse_mode: 'Markdown' }).catch(() => {});
     sendAdminPanel(chatId);
   } else if (currentAction === 'unban') {
     if (store.users[strId]) {
       store.users[strId].banned = false;
       saveStore();
     }
-    bot.sendMessage(chatId, `✅ تم فك حظر المستخدم: \`${targetId}\``, { parse_mode: 'Markdown' });
+    bot.sendMessage(chatId, `✅ تم فك حظر المستخدم: \`${targetId}\``, { parse_mode: 'Markdown' }).catch(() => {});
     sendAdminPanel(chatId);
   } else if (currentAction === 'tester') {
     if (!store.system.allowedTesters.includes(strId)) {
       store.system.allowedTesters.push(strId);
       saveStore();
     }
-    bot.sendMessage(chatId, `🧪 تم إضافة المختبر بنجاح: \`${strId}\``, { parse_mode: 'Markdown' });
+    bot.sendMessage(chatId, `🧪 تم إضافة المختبر بنجاح: \`${strId}\``, { parse_mode: 'Markdown' }).catch(() => {});
     sendAdminPanel(chatId);
   } else if (currentAction === 'history') {
     const userData = store.users[strId];
     if (!userData || typeof userData !== 'object') {
-      bot.sendMessage(chatId, `⚠️ لم يتم العثور على مستخدم بالمعرف \`${strId}\`.`, { parse_mode: 'Markdown' });
+      bot.sendMessage(chatId, `⚠️ لم يتم العثور على مستخدم بالمعرف \`${strId}\`.`, { parse_mode: 'Markdown' }).catch(() => {});
       return sendAdminPanel(chatId);
     }
 
@@ -824,7 +842,9 @@ bot.on('message', (msg) => {
       report = report.slice(0, 3900) + '\n...';
     }
 
-    bot.sendMessage(chatId, report, { parse_mode: 'Markdown' }).then(() => sendAdminPanel(chatId));
+    bot.sendMessage(chatId, report, { parse_mode: 'Markdown' })
+      .catch(() => {})
+      .finally(() => sendAdminPanel(chatId));
   }
 });
 
@@ -1070,7 +1090,7 @@ http.createServer((req, res) => {
   if (req.method === 'POST' && parsedUrl.pathname === '/api/sync-user') {
     let body = '';
     req.on('data', chunk => { body += chunk; });
-    req.on('end', async () => {
+    req.on('end', () => {
       try {
         const payload = JSON.parse(body || '{}');
         const uId = String(payload.uid || '').trim();
