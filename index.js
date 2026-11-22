@@ -356,22 +356,34 @@ function syncTopLeaderboardPersistent() {
     const existingEntry = mapByUid.get(String(uId));
     const finalCount = Math.max(computedCount, Number(existingEntry?.verifiedReferrals || 0));
 
-    if (finalCount > 0) {
-      mapByUid.set(String(uId), {
-        uid: String(uId),
-        firstName: u.firstName || existingEntry?.firstName || 'Miner',
-        username: u.username || existingEntry?.username || '',
-        photoUrl: `${BOT_BASE_URL}/api/avatar?uid=${encodeURIComponent(String(uId))}`,
-        verifiedReferrals: finalCount
-      });
-    }
+    mapByUid.set(String(uId), {
+      uid: String(uId),
+      firstName: u.firstName || existingEntry?.firstName || 'Miner',
+      username: u.username || existingEntry?.username || '',
+      photoUrl: `${BOT_BASE_URL}/api/avatar?uid=${encodeURIComponent(String(uId))}`,
+      verifiedReferrals: finalCount
+    });
   }
 
-  store.topLeaderboard = Array.from(mapByUid.values())
-    .filter(item => Number(item.verifiedReferrals || 0) > 0)
-    .sort((a, b) => Number(b.verifiedReferrals || 0) - Number(a.verifiedReferrals || 0))
-    .slice(0, 20);
+  const sorted = Array.from(mapByUid.values())
+    .sort((a, b) => Number(b.verifiedReferrals || 0) - Number(a.verifiedReferrals || 0));
 
+  let slotIndex = 1;
+  while (sorted.length < 20) {
+    const slotUid = `slot_${slotIndex}`;
+    if (!sorted.some(x => String(x.uid) === slotUid)) {
+      sorted.push({
+        uid: slotUid,
+        firstName: `Miner #${slotIndex}`,
+        username: '',
+        photoUrl: '',
+        verifiedReferrals: 0
+      });
+    }
+    slotIndex++;
+  }
+
+  store.topLeaderboard = sorted.slice(0, 20);
   return store.topLeaderboard;
 }
 
@@ -469,6 +481,7 @@ bot.onText(/\/start(.*)/, (msg, match) => {
   if (!existedBefore) {
     addUserHistory(uidStr, 'Account Created', 0, 'Joined via /start', 0);
   } else {
+    syncTopLeaderboardPersistent();
     saveStore();
   }
 
