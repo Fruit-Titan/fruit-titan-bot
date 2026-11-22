@@ -57,14 +57,15 @@ function saveStore() {
   }
 }
 
-function addUserHistory(userId, source, amount, details = '', balanceAfter = null) {
+function ensureUserRecord(userId, meta = {}) {
   const key = String(userId);
-  if (!key || key === 'guest_miner') return;
+  if (!key || key === 'guest_miner') return null;
   if (!store.users[key]) {
     store.users[key] = {
       uid: key,
-      username: '',
-      firstName: 'Miner',
+      username: meta.username || '',
+      firstName: meta.firstName || 'Miner',
+      photoUrl: meta.photoUrl || '',
       balance: 0,
       vip: 1,
       banned: false,
@@ -73,28 +74,114 @@ function addUserHistory(userId, source, amount, details = '', balanceAfter = nul
       onChainWalletROL: 0,
       refCount: 0,
       refEarn: 0,
+      referralsList: [],
       completedTasks: [],
       history: [],
       createdAt: Date.now(),
       updatedAt: Date.now()
     };
   }
-  if (!Array.isArray(store.users[key].history)) {
-    store.users[key].history = [];
-  }
+  if (!Array.isArray(store.users[key].history)) store.users[key].history = [];
+  if (!Array.isArray(store.users[key].referralsList)) store.users[key].referralsList = [];
+  return store.users[key];
+}
+
+function addUserHistory(userId, source, amount, details = '', balanceAfter = null) {
+  const key = String(userId);
+  const u = ensureUserRecord(key);
+  if (!u) return;
   const numAmount = Number(amount || 0);
-  store.users[key].history.push({
+  u.history.push({
     source: String(source || 'عملية'),
     amount: numAmount,
     details: String(details || ''),
-    balanceAfter: balanceAfter !== null ? Number(balanceAfter) : Number(store.users[key].balance || 0),
+    balanceAfter: balanceAfter !== null ? Number(balanceAfter) : Number(u.balance || 0),
     timestamp: Date.now()
   });
-  if (store.users[key].history.length > 100) {
-    store.users[key].history = store.users[key].history.slice(-100);
+  if (u.history.length > 100) {
+    u.history = u.history.slice(-100);
   }
-  store.users[key].updatedAt = Date.now();
+  u.updatedAt = Date.now();
   saveStore();
+}
+
+function registerReferralLink(referrerId, invitedId, invitedMeta = {}) {
+  const refKey = String(referrerId || '').trim();
+  const invKey = String(invitedId || '').trim();
+  if (!refKey || !invKey || refKey === invKey || refKey === 'guest_miner' || invKey === 'guest_miner') return;
+
+  const invUser = ensureUserRecord(invKey, invitedMeta);
+  if (invUser && !invUser.referredBy) {
+    invUser.referredBy = refKey;
+  }
+
+  const refUser = ensureUserRecord(refKey);
+  if (!refUser) return;
+
+  const existingIdx = refUser.referralsList.findIndex(item => String(item.uid) === invKey);
+  const entry = {
+    uid: invKey,
+    username: invitedMeta.username || invUser?.username || '',
+    firstName: invitedMeta.firstName || invUser?.firstName || 'User',
+    photoUrl: invitedMeta.photoUrl || invUser?.photoUrl || '',
+    verified: Boolean(invUser?.isVerified),
+    rewardGranted: existingIdx >= 0 ? Boolean(refUser.referralsList[existingIdx].rewardGranted) : false,
+    joinedAt: existingIdx >= 0 ? Number(refUser.referralsList[existingIdx].joinedAt || Date.now()) : Date.now()
+  };
+
+  if (existingIdx >= 0) {
+    refUser.referralsList[existingIdx] = {
+      ...refUser.referralsList[existingIdx],
+      ...entry
+    };
+  } else {
+    refUser.referralsList.push(entry);
+  }
+  saveStore();
+}
+
+function confirmReferralForReferrer(referrerId, invitedId, invitedMeta = {}) {
+  const refKey = String(referrerId || '').trim();
+  const invKey = String(invitedId || '').trim();
+  if (!refKey || !invKey || refKey === invKey || refKey === 'guest_miner' || invKey === 'guest_miner') return false;
+
+  registerReferralLink(refKey, invKey, { ...invitedMeta, verified: true });
+  const refUser = ensureUserRecord(refKey);
+  if (!refUser) return false;
+
+  const idx = refUser.referralsList.findIndex(item => String(item.uid) === invKey);
+  if (idx >= 0) {
+    refUser.referralsList[idx].verified = true;
+    refUser.referralsList[idx].verifiedAt = Date.now();
+    if (invitedMeta.username) refUser.referralsList[idx].username = invitedMeta.username;
+    if (invitedMeta.firstName) refUser.referralsList[idx].firstName = invitedMeta.firstName;
+    if (invitedMeta.photoUrl) refUser.referralsList[idx].photoUrl = invitedMeta.photoUrl;
+
+    if (!refUser.referralsList[idx].rewardGranted) {
+      refUser.referralsList[idx].rewardGranted = true;
+      refUser.refCount = Number(refUser.refCount || 0) + 1;
+      refUser.refEarn = Number((Number(refUser.refEarn || 0) + 60).toFixed(2));
+      refUser.balance = Number((Number(refUser.balance || 0) + 60).toFixed(2));
+      refUser.spinTickets = Number(refUser.spinTickets || 0) + 1;
+      addUserHistory(refKey, 'Verified Referral', 60, `From user ${invKey}`, refUser.balance);
+    }
+  }
+  saveStore();
+  return true;
+}
+
+async function getTelegramUserPhotoUrl(userId) {
+  try {
+    const cleanId = Number(userId);
+    if (!cleanId || Number.isNaN(cleanId)) return '';
+    const photos = await bot.getUserProfilePhotos(cleanId, { limit: 1 });
+    const firstPhoto = photos?.photos?.[0];
+    if (!firstPhoto || !firstPhoto.length) return '';
+    const bestSize = firstPhoto[firstPhoto.length - 1];
+    return await bot.getFileLink(bestSize.file_id);
+  } catch (e) {
+    return '';
+  }
 }
 
 async function isUserSubscribedToChannel(userId) {
@@ -153,11 +240,12 @@ bot.on('polling_error', (err) => {
   console.log('Polling error:', err.message);
 });
 
-bot.onText(/\/start(.*)/, (msg, match) => {
+bot.onText(/\/start(.*)/, async (msg, match) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
   const firstName = msg.from.first_name || 'Miner';
-  const startParam = match && match[1] ? match[1].trim() : '';
+  const rawPayload = match && match[1] ? match[1].trim() : '';
+  const startParam = rawPayload.split(/\s+/)[0] || '';
 
   const bannedUsers = getBannedSet();
   if (bannedUsers.has(userId)) {
@@ -165,35 +253,38 @@ bot.onText(/\/start(.*)/, (msg, match) => {
   }
 
   const uidStr = String(userId);
-  if (!store.users[uidStr]) {
-    store.users[uidStr] = {
-      uid: uidStr,
-      username: msg.from.username || '',
-      firstName,
-      balance: 0,
-      vip: 1,
-      banned: false,
-      isVerified: false,
-      wallet: '',
-      onChainWalletROL: 0,
-      refCount: 0,
-      refEarn: 0,
-      completedTasks: [],
-      history: [],
-      createdAt: Date.now(),
-      updatedAt: Date.now()
-    };
-    if (startParam && startParam.startsWith('ref_')) {
-      const refId = startParam.replace('ref_', '').trim();
-      if (refId && refId !== uidStr) {
-        store.users[uidStr].referredBy = refId;
+  const photoUrl = await getTelegramUserPhotoUrl(userId).catch(() => '');
+  const existedBefore = Boolean(store.users[uidStr]);
+  const userRec = ensureUserRecord(uidStr, {
+    username: msg.from.username || '',
+    firstName,
+    photoUrl
+  });
+
+  if (userRec) {
+    userRec.username = msg.from.username || userRec.username || '';
+    userRec.firstName = firstName;
+    if (photoUrl) userRec.photoUrl = photoUrl;
+    userRec.updatedAt = Date.now();
+  }
+
+  if (startParam && startParam.startsWith('ref_')) {
+    const refId = startParam.replace('ref_', '').trim();
+    if (refId && refId !== uidStr) {
+      if (!userRec.referredBy) {
+        userRec.referredBy = refId;
       }
+      registerReferralLink(refId, uidStr, {
+        username: msg.from.username || '',
+        firstName,
+        photoUrl
+      });
     }
+  }
+
+  if (!existedBefore) {
     addUserHistory(uidStr, 'Account Created', 0, 'Joined via /start', 0);
   } else {
-    store.users[uidStr].username = msg.from.username || store.users[uidStr].username || '';
-    store.users[uidStr].firstName = firstName;
-    store.users[uidStr].updatedAt = Date.now();
     saveStore();
   }
 
@@ -531,12 +622,12 @@ bot.on('message', (msg) => {
   const strId = String(targetId);
 
   if (currentAction === 'ban') {
-    if (!store.users[strId]) {
-      store.users[strId] = { uid: strId, balance: 0, vip: 1, history: [], createdAt: Date.now() };
+    const u = ensureUserRecord(strId);
+    if (u) {
+      u.banned = true;
+      u.bannedAt = Date.now();
+      saveStore();
     }
-    store.users[strId].banned = true;
-    store.users[strId].bannedAt = Date.now();
-    saveStore();
     bot.sendMessage(chatId, `✅ تم حظر المستخدم بنجاح: \`${targetId}\``, { parse_mode: 'Markdown' });
     sendAdminPanel(chatId);
   } else if (currentAction === 'unban') {
@@ -741,9 +832,69 @@ http.createServer((req, res) => {
     return;
   }
 
+  if (req.method === 'POST' && parsedUrl.pathname === '/api/referral/track') {
+    let body = '';
+    req.on('data', chunk => { body += chunk; });
+    req.on('end', async () => {
+      try {
+        const payload = JSON.parse(body || '{}');
+        const referrerId = String(payload.referrerId || '').trim();
+        const invitedId = String(payload.invitedId || '').trim();
+        const photoUrl = await getTelegramUserPhotoUrl(invitedId).catch(() => '');
+        registerReferralLink(referrerId, invitedId, {
+          username: payload.username || '',
+          firstName: payload.firstName || 'User',
+          photoUrl: payload.photoUrl || photoUrl || ''
+        });
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: true }));
+      } catch (e) {
+        res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, error: e.message }));
+      }
+    });
+    return;
+  }
+
+  if (req.method === 'POST' && parsedUrl.pathname === '/api/referral/confirm') {
+    let body = '';
+    req.on('data', chunk => { body += chunk; });
+    req.on('end', async () => {
+      try {
+        const payload = JSON.parse(body || '{}');
+        const referrerId = String(payload.referrerId || '').trim();
+        const invitedId = String(payload.invitedId || '').trim();
+        const photoUrl = await getTelegramUserPhotoUrl(invitedId).catch(() => '');
+        const confirmed = confirmReferralForReferrer(referrerId, invitedId, {
+          username: payload.username || '',
+          firstName: payload.firstName || 'User',
+          photoUrl: payload.photoUrl || photoUrl || ''
+        });
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: confirmed }));
+      } catch (e) {
+        res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, error: e.message }));
+      }
+    });
+    return;
+  }
+
   if (req.method === 'GET' && parsedUrl.pathname === '/api/user') {
     const uId = String(parsedUrl.query?.uid || '').trim();
     const userObj = uId && store.users[uId] ? store.users[uId] : null;
+    if (userObj && Array.isArray(userObj.referralsList)) {
+      userObj.referralsList = userObj.referralsList.map(item => {
+        const inv = store.users[String(item.uid)];
+        return {
+          ...item,
+          username: inv?.username || item.username || '',
+          firstName: inv?.firstName || item.firstName || 'User',
+          photoUrl: inv?.photoUrl || item.photoUrl || '',
+          verified: Boolean(inv?.isVerified || item.verified)
+        };
+      });
+    }
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
     res.end(JSON.stringify({
       ok: true,
@@ -757,7 +908,7 @@ http.createServer((req, res) => {
   if (req.method === 'POST' && parsedUrl.pathname === '/api/sync-user') {
     let body = '';
     req.on('data', chunk => { body += chunk; });
-    req.on('end', () => {
+    req.on('end', async () => {
       try {
         const payload = JSON.parse(body || '{}');
         const uId = String(payload.uid || '').trim();
@@ -765,14 +916,34 @@ http.createServer((req, res) => {
           res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
           return res.end(JSON.stringify({ ok: true }));
         }
-        const existing = store.users[uId] || { history: [], createdAt: Date.now() };
+        const existing = ensureUserRecord(uId, payload);
+        const photoUrl = existing.photoUrl || (await getTelegramUserPhotoUrl(uId).catch(() => ''));
         store.users[uId] = {
           ...existing,
           ...payload,
           uid: uId,
+          photoUrl: payload.photoUrl || photoUrl || existing.photoUrl || '',
           history: Array.isArray(existing.history) ? existing.history : [],
+          referralsList: Array.isArray(existing.referralsList) ? existing.referralsList : [],
           updatedAt: Date.now()
         };
+
+        const refBy = store.users[uId].referredBy;
+        if (refBy && refBy !== uId) {
+          registerReferralLink(refBy, uId, {
+            username: store.users[uId].username,
+            firstName: store.users[uId].firstName,
+            photoUrl: store.users[uId].photoUrl
+          });
+          if (store.users[uId].isVerified) {
+            confirmReferralForReferrer(refBy, uId, {
+              username: store.users[uId].username,
+              firstName: store.users[uId].firstName,
+              photoUrl: store.users[uId].photoUrl
+            });
+          }
+        }
+
         if (payload.historyEntry && typeof payload.historyEntry === 'object') {
           store.users[uId].history.push({
             ...payload.historyEntry,
