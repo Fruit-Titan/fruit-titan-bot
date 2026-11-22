@@ -7,6 +7,7 @@ const path = require('path');
 
 const token = process.env.BOT_TOKEN || '9185746835:AAFSJXdgMJI_SH-klpoTpowKMzDQocSOqVo';
 const BASE_APP_URL = process.env.WEBAPP_URL || 'https://fruit-titan.github.io/fruit-titan-app/';
+const BOT_BASE_URL = process.env.BOT_BASE_URL || 'https://fruit-titan-bot.onrender.com';
 const REQUIRED_CHANNEL_USERNAME = process.env.REQUIRED_CHANNEL || 'ROL_TOKN';
 const ADMIN_ID = 1932161126;
 const DATA_FILE = path.join(__dirname, 'rol_bot_data.json');
@@ -1015,7 +1016,7 @@ http.createServer((req, res) => {
   if (req.method === 'POST' && parsedUrl.pathname === '/api/referral/track') {
     let body = '';
     req.on('data', chunk => { body += chunk; });
-    req.on('end', async () => {
+    req.on('end', () => {
       try {
         const payload = JSON.parse(body || '{}');
         const referrerId = String(payload.referrerId || '').trim();
@@ -1039,7 +1040,7 @@ http.createServer((req, res) => {
   if (req.method === 'POST' && parsedUrl.pathname === '/api/referral/confirm') {
     let body = '';
     req.on('data', chunk => { body += chunk; });
-    req.on('end', async () => {
+    req.on('end', () => {
       try {
         const payload = JSON.parse(body || '{}');
         const referrerId = String(payload.referrerId || '').trim();
