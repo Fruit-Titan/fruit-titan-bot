@@ -1,5 +1,6 @@
 const TelegramBot = require('node-telegram-bot-api');
 const http = require('http');
+const https = require('https');
 const url = require('url');
 const fs = require('fs');
 const path = require('path');
@@ -30,6 +31,7 @@ let store = {
 
 let adminInputState = null; // 'ban' | 'unban' | 'tester' | 'history'
 let appVersion = Date.now();
+const avatarCache = new Map(); // uid -> { buffer, contentType, expiresAt }
 
 function loadStore() {
   try {
@@ -217,6 +219,67 @@ async function getTelegramUserPhotoUrl(userId) {
   }
 }
 
+function downloadBufferFromUrl(fileUrl) {
+  return new Promise((resolve, reject) => {
+    https.get(fileUrl, (resp) => {
+      if (resp.statusCode && resp.statusCode >= 300 && resp.statusCode < 400 && resp.headers.location) {
+        return downloadBufferFromUrl(resp.headers.location).then(resolve).catch(reject);
+      }
+      const chunks = [];
+      const contentType = resp.headers['content-type'] || 'image/jpeg';
+      resp.on('data', d => chunks.push(d));
+      resp.on('end', () => resolve({ buffer: Buffer.concat(chunks), contentType }));
+      resp.on('error', reject);
+    }).on('error', reject);
+  });
+}
+
+async function serveUserAvatarImage(userId, res) {
+  const key = String(userId || '').trim();
+  if (!key || key === 'guest_miner') {
+    res.writeHead(404);
+    return res.end();
+  }
+
+  const cached = avatarCache.get(key);
+  if (cached && cached.expiresAt > Date.now()) {
+    res.writeHead(200, {
+      'Content-Type': cached.contentType,
+      'Cache-Control': 'public, max-age=1800'
+    });
+    return res.end(cached.buffer);
+  }
+
+  try {
+    const fileUrl = await getTelegramUserPhotoUrl(key);
+    if (!fileUrl) {
+      res.writeHead(404);
+      return res.end();
+    }
+    const { buffer, contentType } = await downloadBufferFromUrl(fileUrl);
+    if (!buffer || !buffer.length) {
+      res.writeHead(404);
+      return res.end();
+    }
+    avatarCache.set(key, {
+      buffer,
+      contentType,
+      expiresAt: Date.now() + (30 * 60 * 1000)
+    });
+    if (store.users[key]) {
+      store.users[key].photoUrl = `/api/avatar?uid=${encodeURIComponent(key)}`;
+    }
+    res.writeHead(200, {
+      'Content-Type': contentType,
+      'Cache-Control': 'public, max-age=1800'
+    });
+    res.end(buffer);
+  } catch (e) {
+    res.writeHead(404);
+    res.end();
+  }
+}
+
 async function isUserSubscribedToChannel(userId) {
   try {
     const cleanId = Number(userId);
@@ -236,18 +299,35 @@ function getRealUsersList() {
 }
 
 function getTop20VerifiedReferrers() {
-  return getRealUsersList()
+  const realUsers = getRealUsersList();
+  const verifiedByReferrer = new Map();
+
+  for (const [invId, invUser] of realUsers) {
+    if (invUser && invUser.isVerified && invUser.referredBy) {
+      const refId = String(invUser.referredBy).trim();
+      if (refId && refId !== String(invId)) {
+        if (!verifiedByReferrer.has(refId)) verifiedByReferrer.set(refId, new Set());
+        verifiedByReferrer.get(refId).add(String(invId));
+      }
+    }
+  }
+
+  return realUsers
     .filter(([, u]) => !u.banned)
     .map(([uId, u]) => {
-      const verifiedFromList = Array.isArray(u.referralsList)
-        ? u.referralsList.filter(r => Boolean(r && r.verified)).length
-        : 0;
-      const verifiedCount = Math.max(Number(u.refCount || 0), verifiedFromList);
+      const refSet = verifiedByReferrer.get(String(uId)) || new Set();
+      if (Array.isArray(u.referralsList)) {
+        for (const r of u.referralsList) {
+          if (r && r.verified && r.uid) refSet.add(String(r.uid));
+        }
+      }
+      const verifiedCount = Math.max(Number(u.refCount || 0), refSet.size);
+      const avatarEndpoint = `${BOT_BASE_URL}/api/avatar?uid=${encodeURIComponent(String(uId))}`;
       return {
         uid: uId,
         firstName: u.firstName || 'Miner',
         username: u.username || '',
-        photoUrl: u.photoUrl || '',
+        photoUrl: avatarEndpoint,
         verifiedReferrals: verifiedCount
       };
     })
@@ -308,18 +388,18 @@ bot.onText(/\/start(.*)/, async (msg, match) => {
   }
 
   const uidStr = String(userId);
-  const photoUrl = await getTelegramUserPhotoUrl(userId).catch(() => '');
+  const avatarEndpoint = `${BOT_BASE_URL}/api/avatar?uid=${encodeURIComponent(uidStr)}`;
   const existedBefore = Boolean(store.users[uidStr]);
   const userRec = ensureUserRecord(uidStr, {
     username: msg.from.username || '',
     firstName,
-    photoUrl
+    photoUrl: avatarEndpoint
   });
 
   if (userRec) {
     userRec.username = msg.from.username || userRec.username || '';
     userRec.firstName = firstName;
-    if (photoUrl) userRec.photoUrl = photoUrl;
+    userRec.photoUrl = avatarEndpoint;
     userRec.updatedAt = Date.now();
   }
 
@@ -332,7 +412,7 @@ bot.onText(/\/start(.*)/, async (msg, match) => {
       registerReferralLink(refId, uidStr, {
         username: msg.from.username || '',
         firstName,
-        photoUrl
+        photoUrl: avatarEndpoint
       });
     }
   }
@@ -762,6 +842,12 @@ http.createServer((req, res) => {
 
   const parsedUrl = url.parse(req.url, true);
 
+  if (req.method === 'GET' && parsedUrl.pathname === '/api/avatar') {
+    const targetUid = parsedUrl.query?.uid || '';
+    serveUserAvatarImage(targetUid, res);
+    return;
+  }
+
   if (req.method === 'GET' && parsedUrl.pathname === '/api/top-referrals') {
     const contest = getContestState();
     const top20 = getTop20VerifiedReferrers();
@@ -914,11 +1000,11 @@ http.createServer((req, res) => {
         const payload = JSON.parse(body || '{}');
         const referrerId = String(payload.referrerId || '').trim();
         const invitedId = String(payload.invitedId || '').trim();
-        const photoUrl = await getTelegramUserPhotoUrl(invitedId).catch(() => '');
+        const avatarEndpoint = `${BOT_BASE_URL}/api/avatar?uid=${encodeURIComponent(invitedId)}`;
         registerReferralLink(referrerId, invitedId, {
           username: payload.username || '',
           firstName: payload.firstName || 'User',
-          photoUrl: payload.photoUrl || photoUrl || ''
+          photoUrl: avatarEndpoint
         });
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
         res.end(JSON.stringify({ ok: true }));
@@ -938,11 +1024,11 @@ http.createServer((req, res) => {
         const payload = JSON.parse(body || '{}');
         const referrerId = String(payload.referrerId || '').trim();
         const invitedId = String(payload.invitedId || '').trim();
-        const photoUrl = await getTelegramUserPhotoUrl(invitedId).catch(() => '');
+        const avatarEndpoint = `${BOT_BASE_URL}/api/avatar?uid=${encodeURIComponent(invitedId)}`;
         const confirmed = confirmReferralForReferrer(referrerId, invitedId, {
           username: payload.username || '',
           firstName: payload.firstName || 'User',
-          photoUrl: payload.photoUrl || photoUrl || ''
+          photoUrl: avatarEndpoint
         });
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
         res.end(JSON.stringify({ ok: confirmed }));
@@ -960,11 +1046,12 @@ http.createServer((req, res) => {
     if (userObj && Array.isArray(userObj.referralsList)) {
       userObj.referralsList = userObj.referralsList.map(item => {
         const inv = store.users[String(item.uid)];
+        const invAvatar = `${BOT_BASE_URL}/api/avatar?uid=${encodeURIComponent(String(item.uid))}`;
         return {
           ...item,
           username: inv?.username || item.username || '',
           firstName: inv?.firstName || item.firstName || 'User',
-          photoUrl: inv?.photoUrl || item.photoUrl || '',
+          photoUrl: invAvatar,
           verified: Boolean(inv?.isVerified || item.verified)
         };
       });
@@ -992,12 +1079,12 @@ http.createServer((req, res) => {
           return res.end(JSON.stringify({ ok: true }));
         }
         const existing = ensureUserRecord(uId, payload);
-        const photoUrl = existing.photoUrl || (await getTelegramUserPhotoUrl(uId).catch(() => ''));
+        const avatarEndpoint = `${BOT_BASE_URL}/api/avatar?uid=${encodeURIComponent(uId)}`;
         store.users[uId] = {
           ...existing,
           ...payload,
           uid: uId,
-          photoUrl: payload.photoUrl || photoUrl || existing.photoUrl || '',
+          photoUrl: avatarEndpoint,
           history: Array.isArray(existing.history) ? existing.history : [],
           referralsList: Array.isArray(existing.referralsList) ? existing.referralsList : [],
           updatedAt: Date.now()
