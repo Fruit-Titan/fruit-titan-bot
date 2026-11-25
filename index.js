@@ -1,1227 +1,925 @@
-const TelegramBot = require('node-telegram-bot-api');
-const http = require('http');
-const https = require('https');
-const url = require('url');
-const fs = require('fs');
-const path = require('path');
+const express = require("express");
+const cors = require("cors");
+const fs = require("fs");
+const path = require("path");
+const TelegramBot = require("node-telegram-bot-api");
 
-const token = process.env.BOT_TOKEN || '9185746835:AAFSJXdgMJI_SH-klpoTpowKMzDQocSOqVo';
-const BASE_APP_URL = process.env.WEBAPP_URL || 'https://fruit-titan.github.io/fruit-titan-app/';
-const BOT_BASE_URL = process.env.BOT_BASE_URL || 'https://fruit-titan-bot.onrender.com';
-const REQUIRED_CHANNEL_USERNAME = process.env.REQUIRED_CHANNEL || 'ROL_TOKN';
-const ADMIN_ID = 1932161126;
-const DATA_FILE = path.join(__dirname, 'rol_bot_data.json');
+const app = express();
+app.use(cors());
+app.use(express.json({ limit: "10mb" }));
+
+const PORT = process.env.PORT || 3000;
+const BOT_TOKEN = process.env.BOT_TOKEN || "9185746835:AAFSJXdgMJI_SH-klpoTpowKMzDQocSOqVo";
+const ADMIN_IDS = (process.env.ADMIN_IDS || "1932161126")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+const REQUIRED_CHANNEL = "@ROL_TOKN";
+const REQUIRED_CHANNEL_URL = "https://t.me/ROL_TOKN";
+const ROL_JETTON_MASTER = "EQApOJVuhW8SIGHYAEdYOGvefbBf8r6IiApqyoffbbjXOIFc";
+const VERIFY_DEST_WALLET = "UQCYWzbDk673PWtuz_hwDq9WhGdS9Nz_Ppe-DLIFdNb5BsAb";
+const MINI_APP_URL = process.env.MINI_APP_URL || "https://fruit-titan.github.io/fruit-titan-app/";
+const DATA_FILE = process.env.DATA_FILE_PATH || path.join(__dirname, "rol_bot_data.json");
+
 const CONTEST_DURATION_MS = 7 * 24 * 60 * 60 * 1000;
+const REFERRAL_BONUS_ROL = 60;
+const REFERRAL_BONUS_SPINS = 1;
+const MIN_WITHDRAW_ROL = 10000;
+const CUSTOM_TASK_REWARD_ROL = 10;
+const MIN_CUSTOM_TASK_USERS = 50;
 
-const bot = new TelegramBot(token, {
-  polling: {
-    interval: 300,
-    autoStart: true,
-    params: { timeout: 10 }
-  }
-});
-
-let store = {
-  users: {},
-  withdrawals: {},
-  paidTasks: [],
-  topLeaderboard: [],
-  contest: {
-    startedAt: Date.now(),
-    durationMs: CONTEST_DURATION_MS
-  },
-  system: {
-    maintenanceEnabled: false,
-    maintenanceMessage: 'نقوم حالياً بتحديث النظام وتحسين الأداء. سنعود للعمل قريباً.',
-    allowedTesters: []
-  }
-};
-
-let adminInputState = null; // 'ban' | 'unban' | 'tester' | 'history'
-let appVersion = Date.now();
+const bot = new TelegramBot(BOT_TOKEN, { polling: true });
+const adminStates = new Map();
 const avatarCache = new Map();
 
-function loadStore() {
-  try {
-    if (fs.existsSync(DATA_FILE)) {
-      const raw = fs.readFileSync(DATA_FILE, 'utf8');
-      const parsed = JSON.parse(raw);
-      if (parsed && typeof parsed === 'object') {
-        const startedAt = Number(parsed.contest?.startedAt || Date.now());
-        const durationMs = Number(parsed.contest?.durationMs || CONTEST_DURATION_MS);
-        store = {
-          users: parsed.users && typeof parsed.users === 'object' ? parsed.users : {},
-          withdrawals: parsed.withdrawals && typeof parsed.withdrawals === 'object' ? parsed.withdrawals : {},
-          paidTasks: Array.isArray(parsed.paidTasks) ? parsed.paidTasks : [],
-          topLeaderboard: Array.isArray(parsed.topLeaderboard) ? parsed.topLeaderboard : [],
-          contest: {
-            startedAt: startedAt > 0 ? startedAt : Date.now(),
-            durationMs: durationMs > 0 ? durationMs : CONTEST_DURATION_MS
-          },
-          system: {
-            maintenanceEnabled: Boolean(parsed.system?.maintenanceEnabled),
-            maintenanceMessage: parsed.system?.maintenanceMessage || store.system.maintenanceMessage,
-            allowedTesters: Array.isArray(parsed.system?.allowedTesters) ? parsed.system.allowedTesters.map(String) : []
-          }
-        };
-      }
-    }
-  } catch (e) {
-    console.log('Load store notice:', e.message);
+function ensureParentDir(filePath) {
+  const dir = path.dirname(filePath);
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
   }
 }
+
+function createDefaultStore() {
+  const now = Date.now();
+  return {
+    users: {},
+    tasks: [],
+    withdrawals: [],
+    system: {
+      maintenanceEnabled: false,
+      maintenanceMessage: "نقوم حالياً بتحديث النظام وتحسين الأداء. سنعود للعمل قريباً.",
+      allowedTesters: []
+    },
+    contest: {
+      startedAt: now,
+      endsAt: now + CONTEST_DURATION_MS
+    }
+  };
+}
+
+function loadStore() {
+  const fallback = createDefaultStore();
+  try {
+    if (fs.existsSync(DATA_FILE)) {
+      const raw = fs.readFileSync(DATA_FILE, "utf8");
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === "object") {
+        const merged = {
+          users: parsed.users && typeof parsed.users === "object" ? parsed.users : {},
+          tasks: Array.isArray(parsed.tasks) ? parsed.tasks : [],
+          withdrawals: Array.isArray(parsed.withdrawals) ? parsed.withdrawals : [],
+          system: {
+            maintenanceEnabled: Boolean(parsed.system?.maintenanceEnabled),
+            maintenanceMessage:
+              parsed.system?.maintenanceMessage ||
+              "نقوم حالياً بتحديث النظام وتحسين الأداء. سنعود للعمل قريباً.",
+            allowedTesters: Array.isArray(parsed.system?.allowedTesters)
+              ? parsed.system.allowedTesters.map(String)
+              : []
+          },
+          contest: {
+            startedAt: Number(parsed.contest?.startedAt) > 0 ? Number(parsed.contest.startedAt) : Date.now(),
+            endsAt:
+              Number(parsed.contest?.endsAt) > 0
+                ? Number(parsed.contest.endsAt)
+                : (Number(parsed.contest?.startedAt) || Date.now()) + CONTEST_DURATION_MS
+          }
+        };
+        return merged;
+      }
+    }
+  } catch (err) {
+    console.error("Failed to load store:", err.message);
+  }
+  return fallback;
+}
+
+let store = loadStore();
 
 function saveStore() {
   try {
-    const tmpFile = `${DATA_FILE}.tmp`;
-    fs.writeFileSync(tmpFile, JSON.stringify(store), 'utf8');
-    fs.renameSync(tmpFile, DATA_FILE);
-  } catch (e) {
+    ensureParentDir(DATA_FILE);
+    const tempPath = `${DATA_FILE}.tmp`;
+    fs.writeFileSync(tempPath, JSON.stringify(store, null, 2), "utf8");
+    fs.renameSync(tempPath, DATA_FILE);
+  } catch (err) {
     try {
-      fs.writeFileSync(DATA_FILE, JSON.stringify(store), 'utf8');
-    } catch (err2) {
-      console.log('Save store notice:', err2.message);
+      fs.writeFileSync(DATA_FILE, JSON.stringify(store, null, 2), "utf8");
+    } catch (e2) {
+      console.error("Failed to save store:", e2.message);
     }
   }
 }
 
-function getContestState() {
-  if (!store.contest || !store.contest.startedAt) {
-    store.contest = { startedAt: Date.now(), durationMs: CONTEST_DURATION_MS };
-    saveStore();
-  }
+saveStore();
+
+function normalizeContestWindow() {
+  store.contest = store.contest || {};
   const now = Date.now();
-  const duration = Number(store.contest.durationMs || CONTEST_DURATION_MS);
-  let elapsed = now - Number(store.contest.startedAt);
-  let changed = false;
-  while (elapsed >= duration) {
-    store.contest.startedAt = Number(store.contest.startedAt) + duration;
-    elapsed = now - Number(store.contest.startedAt);
-    changed = true;
+  let startedAt = Number(store.contest.startedAt) || now;
+  let endsAt = Number(store.contest.endsAt) || startedAt + CONTEST_DURATION_MS;
+
+  while (endsAt <= now) {
+    startedAt = endsAt;
+    endsAt = startedAt + CONTEST_DURATION_MS;
   }
-  if (changed) saveStore();
-  const endsAt = Number(store.contest.startedAt) + duration;
-  const remainingMs = Math.max(0, endsAt - now);
-  return {
-    startedAt: Number(store.contest.startedAt),
-    endsAt,
-    remainingMs
-  };
+
+  store.contest.startedAt = startedAt;
+  store.contest.endsAt = endsAt;
+  return store.contest;
 }
 
-function ensureUserRecord(userId, meta = {}) {
-  const key = String(userId);
-  if (!key || key === 'guest_miner') return null;
+function isAdmin(userId) {
+  return ADMIN_IDS.includes(String(userId));
+}
+
+function ensureUserRecord(uid, extra = {}) {
+  const key = String(uid);
+  store.users = store.users || {};
   if (!store.users[key]) {
     store.users[key] = {
       uid: key,
-      username: meta.username || '',
-      firstName: meta.firstName || 'Miner',
-      photoUrl: meta.photoUrl || '',
+      username: extra.username || "",
+      firstName: extra.firstName || `Miner ${key}`,
       balance: 0,
       vip: 1,
-      banned: false,
-      isVerified: false,
-      wallet: '',
+      dailyProfit24h: 400,
       onChainWalletROL: 0,
+      wallet: "",
+      isVerified: false,
+      verifyProof: "",
+      firstFreeUsed: false,
+      spinTickets: 0,
+      startTime: 0,
+      checkinDay: 0,
+      lastCheckinTime: 0,
+      completedTasks: [],
       refCount: 0,
       refEarn: 0,
       referralsList: [],
-      completedTasks: [],
+      referredBy: extra.referredBy || "",
+      banned: false,
       history: [],
-      createdAt: Date.now(),
       updatedAt: Date.now()
     };
   }
-  if (!Array.isArray(store.users[key].history)) store.users[key].history = [];
-  if (!Array.isArray(store.users[key].referralsList)) store.users[key].referralsList = [];
-  return store.users[key];
+  const u = store.users[key];
+  u.uid = key;
+  if (extra.username) u.username = extra.username;
+  if (extra.firstName) u.firstName = extra.firstName;
+  if (extra.referredBy && !u.referredBy) u.referredBy = String(extra.referredBy);
+  u.referralsList = Array.isArray(u.referralsList) ? u.referralsList : [];
+  u.history = Array.isArray(u.history) ? u.history : [];
+  u.completedTasks = Array.isArray(u.completedTasks) ? u.completedTasks : [];
+  return u;
 }
 
-function addUserHistory(userId, source, amount, details = '', balanceAfter = null) {
-  const key = String(userId);
-  const u = ensureUserRecord(key);
-  if (!u) return;
-  const numAmount = Number(amount || 0);
-  u.history.push({
-    source: String(source || 'عملية'),
-    amount: numAmount,
-    details: String(details || ''),
-    balanceAfter: balanceAfter !== null ? Number(balanceAfter) : Number(u.balance || 0),
-    timestamp: Date.now()
-  });
-  if (u.history.length > 100) {
-    u.history = u.history.slice(-100);
-  }
-  u.updatedAt = Date.now();
-  saveStore();
+function getVerifiedCountForUser(user) {
+  if (!user) return 0;
+  const listVerified = Array.isArray(user.referralsList)
+    ? user.referralsList.filter((r) => Boolean(r && r.verified)).length
+    : 0;
+  return Math.max(Number(user.refCount || 0), listVerified);
 }
 
-function registerReferralLink(referrerId, invitedId, invitedMeta = {}) {
-  const refKey = String(referrerId || '').trim();
-  const invKey = String(invitedId || '').trim();
-  if (!refKey || !invKey || refKey === invKey || refKey === 'guest_miner' || invKey === 'guest_miner') return;
+function getTop20List() {
+  const usersArr = Object.values(store.users || {}).filter((u) => u && !u.banned);
+  return usersArr
+    .map((u) => ({
+      uid: String(u.uid),
+      firstName: u.firstName || `Miner ${u.uid}`,
+      username: u.username || "",
+      verifiedReferrals: getVerifiedCountForUser(u),
+      photoUrl: u.photoUrl || ""
+    }))
+    .filter((item) => item.verifiedReferrals > 0)
+    .sort((a, b) => b.verifiedReferrals - a.verifiedReferrals)
+    .slice(0, 20);
+}
 
-  const invUser = ensureUserRecord(invKey, invitedMeta);
-  if (invUser && !invUser.referredBy) {
-    invUser.referredBy = refKey;
-  }
-
-  const refUser = ensureUserRecord(refKey);
-  if (!refUser) return;
-
-  const existingIdx = refUser.referralsList.findIndex(item => String(item.uid) === invKey);
-  const entry = {
-    uid: invKey,
-    username: invitedMeta.username || invUser?.username || '',
-    firstName: invitedMeta.firstName || invUser?.firstName || 'User',
-    photoUrl: invitedMeta.photoUrl || invUser?.photoUrl || '',
-    verified: Boolean(invUser?.isVerified),
-    rewardGranted: existingIdx >= 0 ? Boolean(refUser.referralsList[existingIdx].rewardGranted) : false,
-    joinedAt: existingIdx >= 0 ? Number(refUser.referralsList[existingIdx].joinedAt || Date.now()) : Date.now()
+function getAdminKeyboard() {
+  return {
+    inline_keyboard: [
+      [
+        { text: "🏆 حاملي العملة Top 100", callback_data: "admin_top100" },
+        { text: "📩 مراجعة السحوبات", callback_data: "admin_withdrawals" }
+      ],
+      [
+        { text: "👥 إحصائيات المستخدمين", callback_data: "admin_stats" },
+        { text: "🗂️ سجل مستخدم (History)", callback_data: "admin_history" }
+      ],
+      [
+        { text: "🚫 حظر مستخدم", callback_data: "admin_ban" },
+        { text: "📋 المهام (الحالية والسابقة)", callback_data: "admin_tasks" }
+      ],
+      [
+        { text: "🧪 إضافة مختبر", callback_data: "admin_add_tester" },
+        { text: "✅ إلغاء حظر", callback_data: "admin_unban" }
+      ],
+      [
+        { text: "💾 نسخة احتياطية للبيانات", callback_data: "admin_backup" },
+        {
+          text: store.system?.maintenanceEnabled
+            ? "🟢 إيقاف صيانة التطبيق"
+            : "🔴 تفعيل صيانة التطبيق",
+          callback_data: "admin_toggle_maint"
+        }
+      ],
+      [
+        { text: "➕ إضافة إحالات موثقة", callback_data: "admin_add_refs" },
+        { text: "🔄 تحديث الإحصائيات", callback_data: "admin_stats" }
+      ],
+      [
+        { text: "⚠️ تصفير جميع الأرصدة (Reset)", callback_data: "admin_reset_confirm" }
+      ]
+    ]
   };
-
-  if (existingIdx >= 0) {
-    refUser.referralsList[existingIdx] = {
-      ...refUser.referralsList[existingIdx],
-      ...entry
-    };
-  } else {
-    refUser.referralsList.push(entry);
-  }
-  syncTopLeaderboardPersistent();
-  saveStore();
 }
 
-function confirmReferralForReferrer(referrerId, invitedId, invitedMeta = {}) {
-  const refKey = String(referrerId || '').trim();
-  const invKey = String(invitedId || '').trim();
-  if (!refKey || !invKey || refKey === invKey || refKey === 'guest_miner' || invKey === 'guest_miner') return false;
+function formatAdminPanelMessage() {
+  const users = Object.values(store.users || {});
+  const totalUsers = users.length;
+  const holdersCount = users.filter((u) => Number(u.balance || 0) > 0).length;
+  const bannedCount = users.filter((u) => Boolean(u.banned)).length;
+  const verifiedCount = users.filter((u) => Boolean(u.isVerified)).length;
+  const walletsCount = users.filter((u) => Boolean(u.wallet)).length;
+  const totalRolInside = users.reduce((sum, u) => sum + Number(u.balance || 0), 0);
+  const pendingWithdrawals = (store.withdrawals || []).filter((w) => w.status === "pending").length;
+  const maintStatus = store.system?.maintenanceEnabled ? "مفعل 🔴" : "متوقف 🟢";
+  const testersCount = Array.isArray(store.system?.allowedTesters) ? store.system.allowedTesters.length : 0;
 
-  registerReferralLink(refKey, invKey, { ...invitedMeta, verified: true });
-  const refUser = ensureUserRecord(refKey);
-  if (!refUser) return false;
-
-  const idx = refUser.referralsList.findIndex(item => String(item.uid) === invKey);
-  if (idx >= 0) {
-    refUser.referralsList[idx].verified = true;
-    refUser.referralsList[idx].verifiedAt = Date.now();
-    if (invitedMeta.username) refUser.referralsList[idx].username = invitedMeta.username;
-    if (invitedMeta.firstName) refUser.referralsList[idx].firstName = invitedMeta.firstName;
-    if (invitedMeta.photoUrl) refUser.referralsList[idx].photoUrl = invitedMeta.photoUrl;
-
-    if (!refUser.referralsList[idx].rewardGranted) {
-      refUser.referralsList[idx].rewardGranted = true;
-      refUser.refCount = Number(refUser.refCount || 0) + 1;
-      refUser.refEarn = Number((Number(refUser.refEarn || 0) + 60).toFixed(2));
-      refUser.balance = Number((Number(refUser.balance || 0) + 60).toFixed(2));
-      refUser.spinTickets = Number(refUser.spinTickets || 0) + 1;
-      addUserHistory(refKey, 'Verified Referral', 60, `From user ${invKey}`, refUser.balance);
-    }
-  }
-  syncTopLeaderboardPersistent();
-  saveStore();
-  return true;
-}
-
-async function getTelegramUserPhotoUrl(userId) {
-  try {
-    const cleanId = Number(userId);
-    if (!cleanId || Number.isNaN(cleanId)) return '';
-    const photos = await bot.getUserProfilePhotos(cleanId, { limit: 1 });
-    const firstPhoto = photos?.photos?.[0];
-    if (!firstPhoto || !firstPhoto.length) return '';
-    const bestSize = firstPhoto[firstPhoto.length - 1];
-    return await bot.getFileLink(bestSize.file_id);
-  } catch (e) {
-    return '';
-  }
-}
-
-function downloadBufferFromUrl(fileUrl) {
-  return new Promise((resolve, reject) => {
-    https.get(fileUrl, (resp) => {
-      if (resp.statusCode && resp.statusCode >= 300 && resp.statusCode < 400 && resp.headers.location) {
-        return downloadBufferFromUrl(resp.headers.location).then(resolve).catch(reject);
-      }
-      const chunks = [];
-      const contentType = resp.headers['content-type'] || 'image/jpeg';
-      resp.on('data', d => chunks.push(d));
-      resp.on('end', () => resolve({ buffer: Buffer.concat(chunks), contentType }));
-      resp.on('error', reject);
-    }).on('error', reject);
-  });
-}
-
-async function serveUserAvatarImage(userId, res) {
-  const key = String(userId || '').trim();
-  if (!key || key === 'guest_miner') {
-    res.writeHead(404);
-    return res.end();
-  }
-
-  const cached = avatarCache.get(key);
-  if (cached && cached.expiresAt > Date.now()) {
-    res.writeHead(200, {
-      'Content-Type': cached.contentType,
-      'Cache-Control': 'public, max-age=1800'
-    });
-    return res.end(cached.buffer);
-  }
-
-  try {
-    const fileUrl = await getTelegramUserPhotoUrl(key);
-    if (!fileUrl) {
-      res.writeHead(404);
-      return res.end();
-    }
-    const { buffer, contentType } = await downloadBufferFromUrl(fileUrl);
-    if (!buffer || !buffer.length) {
-      res.writeHead(404);
-      return res.end();
-    }
-    avatarCache.set(key, {
-      buffer,
-      contentType,
-      expiresAt: Date.now() + (30 * 60 * 1000)
-    });
-    res.writeHead(200, {
-      'Content-Type': contentType,
-      'Cache-Control': 'public, max-age=1800'
-    });
-    res.end(buffer);
-  } catch (e) {
-    res.writeHead(404);
-    res.end();
-  }
-}
-
-async function isUserSubscribedToChannel(userId) {
-  try {
-    const cleanId = Number(userId);
-    if (!cleanId || Number.isNaN(cleanId)) return false;
-    const member = await bot.getChatMember(`@${REQUIRED_CHANNEL_USERNAME}`, cleanId);
-    const allowedStatuses = ['creator', 'administrator', 'member'];
-    return Boolean(member && allowedStatuses.includes(member.status));
-  } catch (err) {
-    console.log('Channel membership check error:', err.message);
-    return false;
-  }
-}
-
-function getRealUsersList() {
-  return Object.entries(store.users || {})
-    .filter(([k, u]) => u && typeof u === 'object' && k !== 'guest_miner');
-}
-
-function syncTopLeaderboardPersistent() {
-  const realUsers = getRealUsersList();
-  const verifiedByReferrer = new Map();
-
-  for (const [invId, invUser] of realUsers) {
-    if (invUser && invUser.isVerified && invUser.referredBy) {
-      const refId = String(invUser.referredBy).trim();
-      if (refId && refId !== String(invId)) {
-        if (!verifiedByReferrer.has(refId)) verifiedByReferrer.set(refId, new Set());
-        verifiedByReferrer.get(refId).add(String(invId));
-      }
-    }
-  }
-
-  const mapByUid = new Map();
-  for (const prev of (Array.isArray(store.topLeaderboard) ? store.topLeaderboard : [])) {
-    if (prev && prev.uid) {
-      mapByUid.set(String(prev.uid), {
-        uid: String(prev.uid),
-        firstName: prev.firstName || 'Miner',
-        username: prev.username || '',
-        photoUrl: `${BOT_BASE_URL}/api/avatar?uid=${encodeURIComponent(String(prev.uid))}`,
-        verifiedReferrals: Number(prev.verifiedReferrals || 0)
-      });
-    }
-  }
-
-  for (const [uId, u] of realUsers) {
-    if (!u || u.banned) continue;
-    const refSet = verifiedByReferrer.get(String(uId)) || new Set();
-    if (Array.isArray(u.referralsList)) {
-      for (const r of u.referralsList) {
-        if (r && r.verified && r.uid) refSet.add(String(r.uid));
-      }
-    }
-    const historyVerifiedCount = Array.isArray(u.history)
-      ? u.history.filter(h => h && String(h.source || '').toLowerCase().includes('verified referral')).length
-      : 0;
-    const computedCount = Math.max(Number(u.refCount || 0), refSet.size, historyVerifiedCount);
-    const existingEntry = mapByUid.get(String(uId));
-    const finalCount = Math.max(computedCount, Number(existingEntry?.verifiedReferrals || 0));
-
-    mapByUid.set(String(uId), {
-      uid: String(uId),
-      firstName: u.firstName || existingEntry?.firstName || 'Miner',
-      username: u.username || existingEntry?.username || '',
-      photoUrl: `${BOT_BASE_URL}/api/avatar?uid=${encodeURIComponent(String(uId))}`,
-      verifiedReferrals: finalCount
-    });
-  }
-
-  const sorted = Array.from(mapByUid.values())
-    .sort((a, b) => Number(b.verifiedReferrals || 0) - Number(a.verifiedReferrals || 0));
-
-  let slotIndex = 1;
-  while (sorted.length < 20) {
-    const slotUid = `slot_${slotIndex}`;
-    if (!sorted.some(x => String(x.uid) === slotUid)) {
-      sorted.push({
-        uid: slotUid,
-        firstName: `Miner #${slotIndex}`,
-        username: '',
-        photoUrl: '',
-        verifiedReferrals: 0
-      });
-    }
-    slotIndex++;
-  }
-
-  store.topLeaderboard = sorted.slice(0, 20);
-  return store.topLeaderboard;
-}
-
-function getTop20VerifiedReferrers() {
-  return syncTopLeaderboardPersistent();
-}
-
-function getBannedSet() {
-  return new Set(
-    getRealUsersList()
-      .filter(([, u]) => Boolean(u.banned))
-      .map(([uid]) => Number(uid))
-      .filter(n => !Number.isNaN(n))
+  return (
+    `👑 <b>لوحة تحكم المشرف العليا (ROL Admin)</b>\n\n` +
+    `• إجمالي المستخدمين الحقيقيين: <b>${totalUsers}</b>\n` +
+    `• حاملو العملة داخل البوت (&gt;0 ROL): <b>${holdersCount}</b>\n` +
+    `• الحسابات الموثقة (0.05 GRAM): <b>${verifiedCount}</b>\n` +
+    `• المحافظ المربوطة: <b>${walletsCount}</b>\n` +
+    `• عدد المحظورين: <b>${bannedCount}</b>\n` +
+    `• طلبات السحب المعلقة: <b>${pendingWithdrawals}</b>\n` +
+    `• صيانة التطبيق: <b>${maintStatus}</b>\n` +
+    `• المختبرون المسموح لهم: <b>${testersCount}</b>\n` +
+    `• إجمالي أرصدة ROL داخل البوت: <b>${Number(totalRolInside.toFixed(2))} ROL</b>\n\n` +
+    `اختر الإجراء المطلوب:`
   );
 }
 
-function getPendingWithdrawalsList() {
-  return Object.entries(store.withdrawals || {})
-    .filter(([, w]) => w && w.status === 'pending')
-    .map(([id, w]) => ({ id, ...w }));
-}
-
-function resetAllBalancesLocal() {
-  const list = getRealUsersList();
-  let resetCount = 0;
-  for (const [uidKey, uVal] of list) {
-    store.users[uidKey] = {
-      ...uVal,
-      balance: 0,
-      startTime: 0,
-      resetAt: Date.now()
-    };
-    addUserHistory(uidKey, 'Admin Reset', 0, 'Balance reset by admin', 0);
-    resetCount++;
-  }
+async function sendBackupFile(chatId) {
   saveStore();
-  return resetCount;
+  try {
+    await bot.sendDocument(
+      chatId,
+      DATA_FILE,
+      {
+        caption: "🗂️ نسخة احتياطية لبيانات البوت والمستخدمين والمهام"
+      },
+      {
+        filename: "rol_bot_data.json",
+        contentType: "application/json"
+      }
+    );
+  } catch (err) {
+    await bot.sendMessage(chatId, `⚠️ تعذر إرسال الملف: ${err.message}`);
+  }
 }
 
-loadStore();
-getContestState();
-syncTopLeaderboardPersistent();
-
-bot.on('polling_error', (err) => {
-  console.log('Polling error:', err.message);
-});
-
-bot.on('webhook_error', (err) => {
-  console.log('Webhook error:', err.message);
-});
-
-bot.onText(/\/start(.*)/, (msg, match) => {
-  if (!msg || !msg.from) return;
+bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
   const chatId = msg.chat.id;
-  const userId = msg.from.id;
-  const firstName = msg.from.first_name || 'Miner';
-  const rawPayload = match && match[1] ? match[1].trim() : '';
-  const startParam = rawPayload.split(/\s+/)[0] || '';
+  const fromId = String(msg.from.id);
+  const param = (match && match[1] ? match[1] : "").trim();
+  const refFromStart = param.startsWith("ref_") ? param.replace("ref_", "").trim() : "";
 
-  const bannedUsers = getBannedSet();
-  if (bannedUsers.has(userId)) {
-    return bot.sendMessage(chatId, '🚫 Sorry, your account has been banned from using this bot.').catch(() => {});
-  }
-
-  const uidStr = String(userId);
-  const avatarEndpoint = `${BOT_BASE_URL}/api/avatar?uid=${encodeURIComponent(uidStr)}`;
-  const existedBefore = Boolean(store.users[uidStr]);
-  const userRec = ensureUserRecord(uidStr, {
-    username: msg.from.username || '',
-    firstName,
-    photoUrl: avatarEndpoint
+  const user = ensureUserRecord(fromId, {
+    username: msg.from.username || "",
+    firstName: msg.from.first_name || "Miner",
+    referredBy: refFromStart && refFromStart !== fromId ? refFromStart : ""
   });
 
-  if (userRec) {
-    userRec.username = msg.from.username || userRec.username || '';
-    userRec.firstName = firstName;
-    userRec.photoUrl = avatarEndpoint;
-    userRec.updatedAt = Date.now();
-  }
-
-  if (startParam && startParam.startsWith('ref_')) {
-    const refId = startParam.replace('ref_', '').trim();
-    if (refId && refId !== uidStr) {
-      if (!userRec.referredBy) {
-        userRec.referredBy = refId;
-      }
-      registerReferralLink(refId, uidStr, {
-        username: msg.from.username || '',
-        firstName,
-        photoUrl: avatarEndpoint
+  if (refFromStart && refFromStart !== fromId && store.users[refFromStart]) {
+    const referrer = ensureUserRecord(refFromStart);
+    const exists = referrer.referralsList.some((r) => String(r.uid) === fromId);
+    if (!exists) {
+      referrer.referralsList.push({
+        uid: fromId,
+        firstName: msg.from.first_name || `Miner ${fromId}`,
+        username: msg.from.username || "",
+        verified: false,
+        joinedAt: Date.now()
       });
+      saveStore();
     }
-  }
-
-  if (!existedBefore) {
-    addUserHistory(uidStr, 'Account Created', 0, 'Joined via /start', 0);
   } else {
-    syncTopLeaderboardPersistent();
     saveStore();
   }
 
-  const maintParam = store.system.maintenanceEnabled ? '&maint=1' : '';
-  const refQuery = startParam ? `&tgWebAppStartParam=${encodeURIComponent(startParam)}` : '';
-  const webAppUrlWithVersion = `${BASE_APP_URL}?v=${appVersion}${maintParam}${refQuery}`;
-  const welcomeText = `Welcome ${firstName} to the official ROL Mining app!\n\nTap the button below to launch the mini app and start mining:`;
-  const keyboard = [
-    [{ text: '🚀 Start ROL Mining Now', web_app: { url: webAppUrlWithVersion } }]
-  ];
-
-  if (userId === ADMIN_ID) {
-    keyboard.push([{ text: '👑 لوحة تحكم المشرف (Admin)', callback_data: 'admin_panel' }]);
-  }
-
-  bot.sendMessage(chatId, welcomeText, {
-    parse_mode: 'Markdown',
-    reply_markup: { inline_keyboard: keyboard }
-  }).catch((e) => console.log('sendMessage /start err:', e.message));
-});
-
-bot.onText(/\/admin/, (msg) => {
-  if (!msg || !msg.from) return;
-  if (msg.from.id !== ADMIN_ID) {
-    return bot.sendMessage(msg.chat.id, '⛔ هذا الأمر مخصص لمالك البوت فقط.').catch(() => {});
-  }
-  sendAdminPanel(msg.chat.id);
-});
-
-function sendAdminPanel(chatId, messageId = null) {
-  const realUsers = getRealUsersList();
-  const totalUsersCount = realUsers.length;
-  const activeHoldersCount = realUsers.filter(([, u]) => Number(u.balance || 0) > 0).length;
-  const bannedUsers = getBannedSet();
-  const pendingWithdrawals = getPendingWithdrawalsList();
-  const maintBadge = store.system.maintenanceEnabled ? 'مفعّل في التطبيق 🔴' : 'متوقف 🟢';
-
-  const text = `👑 *لوحة تحكم المشرف العليا (ROL Admin)*\n\n` +
-               `👥 إجمالي المستخدمين الحقيقيين: *${totalUsersCount}*\n` +
-               `💰 حاملو العملة داخل البوت (>0): *${activeHoldersCount}*\n` +
-               `🚫 عدد المحظورين: *${bannedUsers.size}*\n` +
-               `📥 طلبات السحب المعلقة: *${pendingWithdrawals.length}*\n` +
-               `🛠️ صيانة التطبيق: *${maintBadge}*\n` +
-               `🧪 المختبرون المسموح لهم: *${store.system.allowedTesters.length}*\n\n` +
-               `اختر الإجراء المطلوب:`;
-
-  const inline_keyboard = [
+  const keyboardRows = [
     [
-      { text: '📥 مراجعة السحوبات', callback_data: 'admin_withdrawals' },
-      { text: '🏆 Top 100 حاملي العملة', callback_data: 'admin_top100' }
-    ],
-    [
-      { text: '📜 سجل مستخدم (History)', callback_data: 'admin_user_history' },
-      { text: '👥 إحصائيات المستخدمين', callback_data: 'admin_real_users' }
-    ],
-    [
-      { text: '📋 المهام (الحالية والسابقة)', callback_data: 'admin_tasks_report' },
-      { text: '🚫 حظر مستخدم', callback_data: 'admin_ban' }
-    ],
-    [
-      { text: '✅ إلغاء حظر', callback_data: 'admin_unban' },
-      { text: '🧪 إضافة مختبر', callback_data: 'admin_add_tester' }
+      {
+        text: "🚀 Start ROL Mining Now",
+        web_app: { url: MINI_APP_URL }
+      }
     ],
     [
       {
-        text: store.system.maintenanceEnabled ? '🟢 إيقاف صيانة التطبيق' : '🔴 تفعيل صيانة التطبيق',
-        callback_data: 'admin_toggle_maintenance'
-      },
-      { text: '💾 نسخة احتياطية للبيانات', callback_data: 'admin_backup' }
-    ],
-    [
-      { text: '⚠️ تصفير جميع الأرصدة (Reset)', callback_data: 'admin_confirm_reset' }
-    ],
-    [
-      { text: '🔄 تحديث الإحصائيات', callback_data: 'admin_panel' }
+        text: "📢 Official Channel (@ROL_TOKN)",
+        url: REQUIRED_CHANNEL_URL
+      }
     ]
   ];
 
-  if (messageId) {
-    bot.editMessageText(text, {
-      chat_id: chatId,
-      message_id: messageId,
-      parse_mode: 'Markdown',
-      reply_markup: { inline_keyboard }
-    }).catch(() => {});
-  } else {
-    bot.sendMessage(chatId, text, {
-      parse_mode: 'Markdown',
-      reply_markup: { inline_keyboard }
-    }).catch(() => {});
-  }
-}
-
-bot.on('callback_query', (query) => {
-  if (!query || !query.message || !query.from) return;
-  const chatId = query.message.chat.id;
-  const messageId = query.message.message_id;
-  const data = query.data;
-  const userId = query.from.id;
-
-  if (userId !== ADMIN_ID) {
-    return bot.answerCallbackQuery(query.id, { text: 'غير مصرح لك!', show_alert: true }).catch(() => {});
-  }
-
-  if (data === 'admin_panel') {
-    sendAdminPanel(chatId, messageId);
-    bot.answerCallbackQuery(query.id).catch(() => {});
-  }
-  else if (data === 'admin_backup') {
-    saveStore();
-    if (fs.existsSync(DATA_FILE)) {
-      bot.sendDocument(chatId, fs.createReadStream(DATA_FILE), {
-        caption: '💾 نسخة احتياطية لبيانات البوت والمستخدمين والمهام'
-      }, { filename: 'rol_bot_data.json' }).catch(() => {});
-    }
-    bot.answerCallbackQuery(query.id, { text: 'تم إرسال النسخة الاحتياطية 💾', show_alert: true }).catch(() => {});
-  }
-  else if (data === 'admin_tasks_report') {
-    const tasksList = Array.isArray(store.paidTasks) ? store.paidTasks : [];
-    let report = `📋 *تقرير المهام (الحالية والسابقة):*\n\n`;
-
-    if (tasksList.length === 0) {
-      report += `_لا توجد مهام مضافة حتى الآن._`;
-    } else {
-      tasksList.slice().reverse().slice(0, 30).forEach((tItem, idx) => {
-        const doneCnt = Number(tItem.completedCount || 0);
-        const targetCnt = Number(tItem.targetUsers || 0);
-        const isFinished = doneCnt >= targetCnt;
-        const statusLabel = isFinished ? 'منتهية ✅' : 'نشطة 🟢';
-        report += `${idx + 1}. *${tItem.label || tItem.url}* — *${statusLabel}*\n` +
-                  `   👥 المنفّذون: *${doneCnt}* / *${targetCnt}* | 💎 المكافأة: *${tItem.rewardRol || 10} ROL*\n` +
-                  `   🔗 \`${tItem.url || '-'}\`\n`;
-      });
-    }
-
-    if (report.length > 3900) {
-      report = report.slice(0, 3850) + '\n...';
-    }
-
-    bot.editMessageText(report, {
-      chat_id: chatId,
-      message_id: messageId,
-      parse_mode: 'Markdown',
-      reply_markup: {
-        inline_keyboard: [[{ text: '🔙 رجوع للوحة التحكم', callback_data: 'admin_panel' }]]
+  if (isAdmin(fromId)) {
+    keyboardRows.push([
+      {
+        text: "👑 لوحة تحكم المشرف (Admin)",
+        callback_data: "admin_panel_open"
       }
-    }).catch(() => {});
-    bot.answerCallbackQuery(query.id).catch(() => {});
+    ]);
   }
-  else if (data === 'admin_toggle_maintenance') {
-    store.system.maintenanceEnabled = !store.system.maintenanceEnabled;
-    saveStore();
-    bot.answerCallbackQuery(query.id, {
-      text: store.system.maintenanceEnabled ? 'تم تفعيل وضع الصيانة في التطبيق 🔴' : 'تم إيقاف وضع الصيانة 🟢',
-      show_alert: true
-    }).catch(() => {});
-    sendAdminPanel(chatId, messageId);
-  }
-  else if (data === 'admin_add_tester') {
-    adminInputState = 'tester';
-    bot.sendMessage(chatId, 'أرسل الآن Telegram ID الخاص بالمختبر للسماح له بدخول التطبيق أثناء الصيانة:').catch(() => {});
-    bot.answerCallbackQuery(query.id).catch(() => {});
-  }
-  else if (data === 'admin_confirm_reset') {
-    const confirmText = `⚠️ *تحذير خطير: تصفير الأرصدة*\n\n` +
-                        `هل أنت متأكد من رغبتك في تصفير جميع أرصدة وتعدين المستخدمين وإعادتهم إلى الصفر؟`;
-    const buttons = [
-      [{ text: '🔥 نعم، صفّر كل الحسابات الآن', callback_data: 'admin_do_reset' }],
-      [{ text: '❌ تراجع', callback_data: 'admin_panel' }]
-    ];
-    bot.editMessageText(confirmText, {
-      chat_id: chatId,
-      message_id: messageId,
-      parse_mode: 'Markdown',
-      reply_markup: { inline_keyboard: buttons }
-    }).catch(() => {});
-    bot.answerCallbackQuery(query.id).catch(() => {});
-  }
-  else if (data === 'admin_do_reset') {
-    const resetCount = resetAllBalancesLocal();
-    appVersion = Date.now();
-    bot.answerCallbackQuery(query.id, {
-      text: `تم تصفير ${resetCount} حساب بنجاح! 🧹`,
-      show_alert: true
-    }).catch(() => {});
-    sendAdminPanel(chatId, messageId);
-  }
-  else if (data === 'admin_withdrawals') {
-    const pendingWithdrawals = getPendingWithdrawalsList();
-    if (pendingWithdrawals.length === 0) {
-      bot.editMessageText('لا توجد طلبات سحب معلقة حالياً.', {
-        chat_id: chatId,
-        message_id: messageId,
-        reply_markup: {
-          inline_keyboard: [[{ text: '🔙 رجوع للوحة التحكم', callback_data: 'admin_panel' }]]
-        }
-      }).catch(() => {});
-      return bot.answerCallbackQuery(query.id).catch(() => {});
+
+  await bot.sendMessage(
+    chatId,
+    `💎 <b>Welcome to ROL Mining (@ROL_Mining_bot)</b>\n\n` +
+      `Mine <b>ROL</b> on the <b>TON</b> blockchain, complete tasks, spin the wheel, invite friends, and compete on the <b>TOP 20</b> leaderboard.\n\n` +
+      `📜 Contract: <code>${ROL_JETTON_MASTER}</code>`,
+    {
+      parse_mode: "HTML",
+      reply_markup: { inline_keyboard: keyboardRows }
     }
-
-    const req = pendingWithdrawals[0];
-    const reqUid = req.uid || req.userId || '-';
-    const text = `📥 *طلب سحب معلق:*\n\n` +
-                 `👤 آيدي المستخدم: \`${reqUid}\`\n` +
-                 `💰 الكمية: *${req.amount || 0} ROL*\n` +
-                 `💸 الرسوم (5%): *${req.feeAmount || 0} ROL* | الصافي: *${req.netAmount || req.amount || 0} ROL*\n` +
-                 `🏦 المحفظة: \`${req.address || '-'}\`\n\n` +
-                 `اختر الإجراء:`;
-
-    const buttons = [
-      [
-        { text: '✅ موافقة', callback_data: `approve_${req.id}` },
-        { text: '❌ رفض ومصادرة', callback_data: `reject_${req.id}` }
-      ],
-      [{ text: '🔙 رجوع', callback_data: 'admin_panel' }]
-    ];
-
-    bot.editMessageText(text, {
-      chat_id: chatId,
-      message_id: messageId,
-      parse_mode: 'Markdown',
-      reply_markup: { inline_keyboard: buttons }
-    }).catch(() => {});
-    bot.answerCallbackQuery(query.id).catch(() => {});
-  }
-  else if (data.startsWith('approve_')) {
-    const reqId = data.replace('approve_', '');
-    if (store.withdrawals[reqId]) {
-      store.withdrawals[reqId].status = 'approved';
-      store.withdrawals[reqId].reviewedAt = Date.now();
-      saveStore();
-    }
-    bot.answerCallbackQuery(query.id, { text: 'تمت الموافقة بنجاح! ✅', show_alert: true }).catch(() => {});
-    sendAdminPanel(chatId, messageId);
-  }
-  else if (data.startsWith('reject_')) {
-    const reqId = data.replace('reject_', '');
-    if (store.withdrawals[reqId]) {
-      store.withdrawals[reqId].status = 'rejected';
-      store.withdrawals[reqId].reviewedAt = Date.now();
-      saveStore();
-    }
-    bot.answerCallbackQuery(query.id, { text: 'تم الرفض ومصادرة العملات نهائياً! 🚫', show_alert: true }).catch(() => {});
-    sendAdminPanel(chatId, messageId);
-  }
-  else if (data === 'admin_ban') {
-    adminInputState = 'ban';
-    bot.sendMessage(chatId, 'أرسل الآن الـ ID الخاص بالحساب المراد حظره:').catch(() => {});
-    bot.answerCallbackQuery(query.id).catch(() => {});
-  }
-  else if (data === 'admin_unban') {
-    adminInputState = 'unban';
-    bot.sendMessage(chatId, 'أرسل الآن الـ ID الخاص بالحساب المراد فك حظره:').catch(() => {});
-    bot.answerCallbackQuery(query.id).catch(() => {});
-  }
-  else if (data === 'admin_real_users') {
-    const valid = getRealUsersList();
-    const totalSupplyInBot = valid.reduce((sum, [, u]) => sum + Number(u.balance || 0), 0);
-    const verifiedCount = valid.filter(([, u]) => Boolean(u.isVerified)).length;
-    const walletLinkedCount = valid.filter(([, u]) => Boolean(u.wallet)).length;
-
-    const statsMsg = `👥 *إحصائيات المستخدمين الحقيقية:*\n\n` +
-                     `• إجمالي الحسابات المسجلة: *${valid.length}*\n` +
-                     `• حاملو رصيد ROL (> 0): *${valid.filter(([, u]) => Number(u.balance || 0) > 0).length}*\n` +
-                     `• الحسابات الموثّقة (0.05 GRAM): *${verifiedCount}*\n` +
-                     `• المحافظ المربوطة: *${walletLinkedCount}*\n` +
-                     `• إجمالي أرصدة ROL داخل البوت: *${Number(totalSupplyInBot.toFixed(2))} ROL*`;
-
-    bot.editMessageText(statsMsg, {
-      chat_id: chatId,
-      message_id: messageId,
-      parse_mode: 'Markdown',
-      reply_markup: {
-        inline_keyboard: [[{ text: '🔙 رجوع للوحة التحكم', callback_data: 'admin_panel' }]]
-      }
-    }).catch(() => {});
-    bot.answerCallbackQuery(query.id).catch(() => {});
-  }
-  else if (data === 'admin_user_history') {
-    adminInputState = 'history';
-    bot.sendMessage(chatId, '📜 أرسل الآن *Telegram ID* الخاص بالمستخدم لعرض سجل جمع عملاته بالتفصيل (History):', {
-      parse_mode: 'Markdown'
-    }).catch(() => {});
-    bot.answerCallbackQuery(query.id).catch(() => {});
-  }
-  else if (data === 'admin_top100') {
-    let topText = `🏆 *أكبر 100 حامل لعملة ROL داخل البوت:*\n\n`;
-    const list = getRealUsersList()
-      .filter(([, u]) => Number(u.balance || 0) > 0)
-      .map(([uId, u]) => ({
-        uid: uId,
-        username: u.username || '',
-        balance: Number(u.balance || 0),
-        verified: u.isVerified ? '✅' : '⏳'
-      }))
-      .sort((a, b) => b.balance - a.balance)
-      .slice(0, 100);
-
-    if (list.length === 0) {
-      topText += `لا يوجد حاملو عملة برصيد أكبر من 0 حالياً.`;
-    } else {
-      list.forEach((item, idx) => {
-        const medal = idx === 0 ? '🥇' : idx === 1 ? '🥈' : idx === 2 ? '🥉' : `${idx + 1}.`;
-        const nameLabel = item.username ? `@${item.username} (\`${item.uid}\`)` : `\`${item.uid}\``;
-        topText += `${medal} ${nameLabel} ${item.verified} — *${item.balance}* ROL\n`;
-      });
-    }
-
-    if (topText.length > 3900) {
-      topText = topText.slice(0, 3850) + '\n...';
-    }
-
-    bot.editMessageText(topText, {
-      chat_id: chatId,
-      message_id: messageId,
-      parse_mode: 'Markdown',
-      reply_markup: {
-        inline_keyboard: [[{ text: '🔙 رجوع للوحة التحكم', callback_data: 'admin_panel' }]]
-      }
-    }).catch(() => {});
-    bot.answerCallbackQuery(query.id).catch(() => {});
-  }
+  );
 });
 
-bot.on('message', (msg) => {
-  if (!msg.from || msg.from.id !== ADMIN_ID || !msg.text || msg.text.startsWith('/')) return;
-  if (!adminInputState) return;
-
+bot.onText(/\/admin/, async (msg) => {
   const chatId = msg.chat.id;
-  const targetId = parseInt(msg.text.trim(), 10);
-  if (isNaN(targetId)) {
-    return bot.sendMessage(chatId, '⚠️ يرجى إرسال رقم ID صحيح.').catch(() => {});
+  if (!isAdmin(msg.from.id)) {
+    return bot.sendMessage(chatId, "⛔ هذا الأمر مخصص للمشرف فقط.");
+  }
+  await bot.sendMessage(chatId, formatAdminPanelMessage(), {
+    parse_mode: "HTML",
+    reply_markup: getAdminKeyboard()
+  });
+});
+
+bot.on("callback_query", async (query) => {
+  const chatId = query.message?.chat?.id;
+  const userId = query.from?.id;
+  const data = query.data || "";
+
+  if (!chatId || !userId) return;
+
+  if (data.startsWith("admin_") && !isAdmin(userId)) {
+    return bot.answerCallbackQuery(query.id, { text: "⛔ للمشرف فقط", show_alert: true });
   }
 
-  const currentAction = adminInputState;
-  adminInputState = null;
-  const strId = String(targetId);
+  if (data === "admin_panel_open") {
+    await bot.answerCallbackQuery(query.id);
+    return bot.sendMessage(chatId, formatAdminPanelMessage(), {
+      parse_mode: "HTML",
+      reply_markup: getAdminKeyboard()
+    });
+  }
 
-  if (currentAction === 'ban') {
-    const u = ensureUserRecord(strId);
-    if (u) {
-      u.banned = true;
-      u.bannedAt = Date.now();
-      saveStore();
-    }
-    bot.sendMessage(chatId, `✅ تم حظر المستخدم بنجاح: \`${targetId}\``, { parse_mode: 'Markdown' }).catch(() => {});
-    sendAdminPanel(chatId);
-  } else if (currentAction === 'unban') {
-    if (store.users[strId]) {
-      store.users[strId].banned = false;
-      saveStore();
-    }
-    bot.sendMessage(chatId, `✅ تم فك حظر المستخدم: \`${targetId}\``, { parse_mode: 'Markdown' }).catch(() => {});
-    sendAdminPanel(chatId);
-  } else if (currentAction === 'tester') {
-    if (!store.system.allowedTesters.includes(strId)) {
-      store.system.allowedTesters.push(strId);
-      saveStore();
-    }
-    bot.sendMessage(chatId, `🧪 تم إضافة المختبر بنجاح: \`${strId}\``, { parse_mode: 'Markdown' }).catch(() => {});
-    sendAdminPanel(chatId);
-  } else if (currentAction === 'history') {
-    const userData = store.users[strId];
-    if (!userData || typeof userData !== 'object') {
-      bot.sendMessage(chatId, `⚠️ لم يتم العثور على مستخدم بالمعرف \`${strId}\`.`, { parse_mode: 'Markdown' }).catch(() => {});
-      return sendAdminPanel(chatId);
-    }
+  if (data === "admin_stats") {
+    await bot.answerCallbackQuery(query.id, { text: "تم تحديث الإحصائيات" });
+    return bot.sendMessage(chatId, formatAdminPanelMessage(), {
+      parse_mode: "HTML",
+      reply_markup: getAdminKeyboard()
+    });
+  }
 
-    const uname = userData.username ? `@${userData.username}` : 'بدون يوزر';
-    const bal = Number(userData.balance || 0);
-    const onChain = Number(userData.onChainWalletROL || 0);
-    const refs = Number(userData.refCount || 0);
-    const refEarn = Number(userData.refEarn || 0);
-    const verifiedTxt = userData.isVerified ? 'موثّق ✅' : 'غير موثّق ❌';
-    const walletTxt = userData.wallet ? `\`${userData.wallet}\`` : 'غير مربوطة';
-    const tasksDone = Array.isArray(userData.completedTasks) ? userData.completedTasks.length : 0;
+  if (data === "admin_add_refs") {
+    adminStates.set(String(userId), { step: "awaiting_ref_target" });
+    await bot.answerCallbackQuery(query.id);
+    return bot.sendMessage(
+      chatId,
+      "➕ <b>إضافة إحالات موثقة لمستخدم</b>\n\n" +
+        "أرسل الآن معرف المستخدم وعدد الإحالات الموثقة المراد إضافتها:\n" +
+        "<code>معرف_المستخدم عدد_الإحالات</code>\n\n" +
+        "مثال:\n<code>8586030968 10</code>\n\n" +
+        "لإلغاء العملية أرسل: <code>/cancel</code>",
+      { parse_mode: "HTML" }
+    );
+  }
 
-    let report = `📜 *سجل المستخدم (User History):*\n\n` +
-                 `👤 المعرف: \`${strId}\` (${uname})\n` +
-                 `💰 الرصيد الحالي في البوت: *${bal} ROL*\n` +
-                 `💎 رصيد المحفظة على الشبكة: *${onChain} ROL*\n` +
-                 `🛡️ حالة التوثيق: *${verifiedTxt}*\n` +
-                 `🏦 المحفظة: ${walletTxt}\n` +
-                 `👥 الإحالات المؤكدة: *${refs}* (أرباحها: *${refEarn} ROL*)\n` +
-                 `✅ المهام المكتملة: *${tasksDone}*\n\n` +
-                 `📊 *آخر العمليات ومصادر جمع العملات:*\n`;
+  if (data === "admin_backup") {
+    await bot.answerCallbackQuery(query.id, { text: "جاري إرسال النسخة الاحتياطية..." });
+    return sendBackupFile(chatId);
+  }
 
-    const entries = Array.isArray(userData.history)
-      ? [...userData.history].sort((a, b) => Number(b.timestamp || 0) - Number(a.timestamp || 0)).slice(0, 25)
-      : [];
+  if (data === "admin_toggle_maint") {
+    store.system = store.system || {};
+    store.system.maintenanceEnabled = !Boolean(store.system.maintenanceEnabled);
+    saveStore();
+    await bot.answerCallbackQuery(query.id, {
+      text: store.system.maintenanceEnabled ? "تم تفعيل وضع الصيانة" : "تم إيقاف وضع الصيانة"
+    });
+    return bot.sendMessage(chatId, formatAdminPanelMessage(), {
+      parse_mode: "HTML",
+      reply_markup: getAdminKeyboard()
+    });
+  }
 
-    if (entries.length === 0) {
-      report += `_لا توجد حركات مسجلة في السجل التفصيلي بعد._`;
-    } else {
-      entries.forEach((ev, idx) => {
-        const dt = ev.timestamp ? new Date(ev.timestamp).toISOString().replace('T', ' ').slice(0, 16) : '-';
-        const sign = Number(ev.amount || 0) >= 0 ? '+' : '';
-        const det = ev.details ? ` (${ev.details})` : '';
-        report += `${idx + 1}. *${ev.source || 'عملية'}*: *${sign}${ev.amount} ROL*${det}\n   🕒 ${dt} UTC\n`;
+  if (data === "admin_top100") {
+    await bot.answerCallbackQuery(query.id);
+    const sorted = Object.values(store.users || {})
+      .sort((a, b) => Number(b.balance || 0) - Number(a.balance || 0))
+      .slice(0, 20);
+    const lines = sorted.map(
+      (u, i) => `${i + 1}. <code>${u.uid}</code> (${u.username ? "@" + u.username : u.firstName || "Miner"}) — <b>${Number(u.balance || 0).toFixed(2)} ROL</b>`
+    );
+    return bot.sendMessage(
+      chatId,
+      `🏆 <b>أعلى 20 رصيداً داخل البوت:</b>\n\n${lines.length ? lines.join("\n") : "لا توجد أرصدة بعد."}`,
+      { parse_mode: "HTML", reply_markup: getAdminKeyboard() }
+    );
+  }
+
+  if (data === "admin_withdrawals") {
+    await bot.answerCallbackQuery(query.id);
+    const pending = (store.withdrawals || []).filter((w) => w.status === "pending");
+    if (!pending.length) {
+      return bot.sendMessage(chatId, "📭 لا توجد طلبات سحب معلقة حالياً.", {
+        reply_markup: getAdminKeyboard()
       });
     }
+    const text = pending
+      .slice(0, 10)
+      .map(
+        (w, i) =>
+          `${i + 1}. <code>${w.uid}</code> | <b>${w.amount} ROL</b> (صافي: ${w.netAmount} ROL)\nمحفظة: <code>${w.address}</code>`
+      )
+      .join("\n\n");
+    return bot.sendMessage(chatId, `📩 <b>طلبات السحب المعلقة (${pending.length}):</b>\n\n${text}`, {
+      parse_mode: "HTML",
+      reply_markup: getAdminKeyboard()
+    });
+  }
 
-    if (report.length > 3950) {
-      report = report.slice(0, 3900) + '\n...';
+  if (data === "admin_tasks") {
+    await bot.answerCallbackQuery(query.id);
+    const list = store.tasks || [];
+    if (!list.length) {
+      return bot.sendMessage(chatId, "📋 لا توجد مهام مسجلة حالياً.", {
+        reply_markup: getAdminKeyboard()
+      });
     }
+    const formatted = list
+      .slice(0, 15)
+      .map((t, idx) => {
+        const done = Number(t.completedCount || 0);
+        const target = Number(t.targetUsers || 0);
+        const status = done >= target ? "✅ منتهية" : "🟢 نشطة";
+        return `${idx + 1}. <b>${t.label || t.url}</b> — ${status}\n👥 المنفذون: ${done} / ${target} | المكافأة: ${t.rewardRol || 10} ROL\n🔗 ${t.url}`;
+      })
+      .join("\n\n");
+    return bot.sendMessage(chatId, `📋 <b>تقرير المهام (الحالية والسابقة):</b>\n\n${formatted}`, {
+      parse_mode: "HTML",
+      reply_markup: getAdminKeyboard()
+    });
+  }
 
-    bot.sendMessage(chatId, report, { parse_mode: 'Markdown' })
-      .catch(() => {})
-      .finally(() => sendAdminPanel(chatId));
+  if (data === "admin_ban" || data === "admin_unban" || data === "admin_add_tester" || data === "admin_history") {
+    adminStates.set(String(userId), { step: data });
+    await bot.answerCallbackQuery(query.id);
+    const prompts = {
+      admin_ban: "🚫 أرسل معرف المستخدم (User ID) لحظر حسابه:",
+      admin_unban: "✅ أرسل معرف المستخدم (User ID) لإلغاء حظره:",
+      admin_add_tester: "🧪 أرسل معرف المستخدم (User ID) لإضافته إلى قائمة المختبرين المسموح لهم أثناء الصيانة:",
+      admin_history: "🗂️ أرسل معرف المستخدم (User ID) لعرض آخر العمليات في سجله:"
+    };
+    return bot.sendMessage(chatId, `${prompts[data]}\n\nلإلغاء العملية أرسل: <code>/cancel</code>`, {
+      parse_mode: "HTML"
+    });
+  }
+
+  if (data === "admin_reset_confirm") {
+    await bot.answerCallbackQuery(query.id);
+    return bot.sendMessage(
+      chatId,
+      "⚠️ <b>تأكيد تصفير جميع الأرصدة</b>\nهذا الإجراء سيصفّر أرصدة وجلسات التعدين لجميع المستخدمين. هل أنت متأكد؟",
+      {
+        parse_mode: "HTML",
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: "⚠️ نعم، صفّر جميع الأرصدة", callback_data: "admin_reset_execute" },
+              { text: "إلغاء", callback_data: "admin_panel_open" }
+            ]
+          ]
+        }
+      }
+    );
+  }
+
+  if (data === "admin_reset_execute") {
+    Object.values(store.users || {}).forEach((u) => {
+      u.balance = 0;
+      u.startTime = 0;
+    });
+    saveStore();
+    await bot.answerCallbackQuery(query.id, { text: "تم تصفير جميع الأرصدة" });
+    return bot.sendMessage(chatId, "✅ تم تصفير أرصدة جميع المستخدمين.", {
+      reply_markup: getAdminKeyboard()
+    });
   }
 });
 
-const PORT = process.env.PORT || 3000;
-http.createServer((req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+bot.on("message", async (msg) => {
+  if (!msg || !msg.from || !msg.text) return;
+  const senderId = String(msg.from.id);
+  const chatId = msg.chat.id;
+  const text = msg.text.trim();
 
-  if (req.method === 'OPTIONS') {
-    res.writeHead(204);
-    res.end();
-    return;
-  }
+  if (!isAdmin(senderId)) return;
 
-  const parsedUrl = url.parse(req.url, true);
+  const state = adminStates.get(senderId);
+  if (!state) return;
 
-  if (req.method === 'GET' && parsedUrl.pathname === '/api/avatar') {
-    const targetUid = parsedUrl.query?.uid || '';
-    serveUserAvatarImage(targetUid, res);
-    return;
-  }
-
-  if (req.method === 'GET' && parsedUrl.pathname === '/api/top-referrals') {
-    const contest = getContestState();
-    const top20 = getTop20VerifiedReferrers();
-    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-    res.end(JSON.stringify({
-      ok: true,
-      top20,
-      contest,
-      prizes: [
-        { rank: 1, reward: '10 GRAM' },
-        { rank: 2, reward: '5 GRAM' },
-        { rank: 3, reward: '3 GRAM' },
-        { rank: 4, reward: '1 GRAM' },
-        { rank: 5, reward: '1 GRAM' }
-      ]
-    }));
-    return;
-  }
-
-  if (req.method === 'GET' && parsedUrl.pathname === '/api/check-channel') {
-    const targetUserId = parsedUrl.query?.userId || '';
-    isUserSubscribedToChannel(targetUserId)
-      .then((joined) => {
-        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({ ok: true, joined: Boolean(joined) }));
-      })
-      .catch(() => {
-        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({ ok: false, joined: false }));
-      });
-    return;
-  }
-
-  if (req.method === 'GET' && parsedUrl.pathname === '/api/tasks') {
-    const activeTasks = (store.paidTasks || []).filter(
-      t => Number(t.completedCount || 0) < Number(t.targetUsers || 0)
-    );
-    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-    res.end(JSON.stringify({ ok: true, tasks: activeTasks }));
-    return;
-  }
-
-  if (req.method === 'POST' && parsedUrl.pathname === '/api/tasks') {
-    let body = '';
-    req.on('data', chunk => { body += chunk; });
-    req.on('end', () => {
-      try {
-        const tData = JSON.parse(body || '{}');
-        const targetUsers = parseInt(tData.targetUsers || '0', 10);
-        if (!tData.url || isNaN(targetUsers) || targetUsers < 50) {
-          res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
-          return res.end(JSON.stringify({ ok: false, error: 'Invalid task data' }));
-        }
-        const taskId = String(tData.id || `ctask_${Date.now()}_${Math.floor(Math.random() * 1000)}`);
-        const existingIdx = (store.paidTasks || []).findIndex(item => String(item.id) === taskId);
-        const taskObj = {
-          id: taskId,
-          url: String(tData.url),
-          label: String(tData.label || tData.url),
-          targetUsers: targetUsers,
-          completedCount: existingIdx >= 0 ? Number(store.paidTasks[existingIdx].completedCount || 0) : 0,
-          completedBy: existingIdx >= 0 && Array.isArray(store.paidTasks[existingIdx].completedBy) ? store.paidTasks[existingIdx].completedBy : [],
-          rewardRol: 10,
-          paidGram: Number(tData.paidGram || ((targetUsers / 50) * 1).toFixed(4)),
-          createdBy: String(tData.createdBy || ''),
-          createdAt: existingIdx >= 0 ? Number(store.paidTasks[existingIdx].createdAt || Date.now()) : Date.now()
-        };
-        if (existingIdx >= 0) {
-          store.paidTasks[existingIdx] = taskObj;
-        } else {
-          store.paidTasks.unshift(taskObj);
-        }
-        saveStore();
-        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({ ok: true, task: taskObj }));
-      } catch (e) {
-        res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({ ok: false, error: e.message }));
-      }
+  if (text.toLowerCase() === "/cancel") {
+    adminStates.delete(senderId);
+    return bot.sendMessage(chatId, "❌ تم إلغاء العملية.", {
+      reply_markup: getAdminKeyboard()
     });
-    return;
   }
 
-  if (req.method === 'POST' && parsedUrl.pathname === '/api/tasks/complete') {
-    let body = '';
-    req.on('data', chunk => { body += chunk; });
-    req.on('end', () => {
-      try {
-        const payload = JSON.parse(body || '{}');
-        const taskId = String(payload.taskId || '').trim();
-        const uId = String(payload.uid || '').trim();
-        let idx = (store.paidTasks || []).findIndex(t => String(t.id) === taskId);
+  if (state.step === "awaiting_ref_target") {
+    const parts = text.split(/\s+/);
+    const targetUid = String(parts[0] || "").trim();
+    const addCount = parseInt(parts[1] || "0", 10);
 
-        if (idx === -1 && payload.taskMeta && payload.taskMeta.url) {
-          const metaUsers = parseInt(payload.taskMeta.targetUsers || '50', 10);
-          store.paidTasks.unshift({
-            id: taskId || `ctask_${Date.now()}`,
-            url: String(payload.taskMeta.url),
-            label: String(payload.taskMeta.label || payload.taskMeta.url),
-            targetUsers: isNaN(metaUsers) ? 50 : metaUsers,
-            completedCount: 0,
-            completedBy: [],
-            rewardRol: 10,
-            paidGram: Number(payload.taskMeta.paidGram || 1),
-            createdBy: String(payload.taskMeta.createdBy || ''),
-            createdAt: Number(payload.taskMeta.createdAt || Date.now())
-          });
-          idx = 0;
-        }
+    if (!targetUid || isNaN(addCount) || addCount <= 0) {
+      return bot.sendMessage(
+        chatId,
+        "⚠️ الصيغة غير صحيحة. أرسل المعرف متبوعاً بعدد صحيح أكبر من 0، مثل:\n<code>8586030968 10</code>",
+        { parse_mode: "HTML" }
+      );
+    }
 
-        if (idx === -1) {
-          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-          return res.end(JSON.stringify({ ok: false, expired: true }));
-        }
+    const targetUser = ensureUserRecord(targetUid);
+    targetUser.referralsList = Array.isArray(targetUser.referralsList) ? targetUser.referralsList : [];
 
-        const taskObj = store.paidTasks[idx];
-        if (!Array.isArray(taskObj.completedBy)) taskObj.completedBy = [];
-        if (uId && uId !== 'guest_miner' && taskObj.completedBy.includes(uId)) {
-          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-          return res.end(JSON.stringify({ ok: false, alreadyCompleted: true }));
-        }
-
-        if (Number(taskObj.completedCount || 0) >= Number(taskObj.targetUsers || 0)) {
-          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-          return res.end(JSON.stringify({ ok: false, expired: true }));
-        }
-
-        if (uId && uId !== 'guest_miner') {
-          taskObj.completedBy.push(uId);
-        }
-        taskObj.completedCount = Number(taskObj.completedCount || 0) + 1;
-        saveStore();
-
-        const stillActive = taskObj.completedCount < Number(taskObj.targetUsers || 0);
-        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({ ok: true, rewardRol: 10, stillActive }));
-      } catch (e) {
-        res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({ ok: false, error: e.message }));
-      }
-    });
-    return;
-  }
-
-  if (req.method === 'POST' && parsedUrl.pathname === '/api/referral/track') {
-    let body = '';
-    req.on('data', chunk => { body += chunk; });
-    req.on('end', () => {
-      try {
-        const payload = JSON.parse(body || '{}');
-        const referrerId = String(payload.referrerId || '').trim();
-        const invitedId = String(payload.invitedId || '').trim();
-        const avatarEndpoint = `${BOT_BASE_URL}/api/avatar?uid=${encodeURIComponent(invitedId)}`;
-        registerReferralLink(referrerId, invitedId, {
-          username: payload.username || '',
-          firstName: payload.firstName || 'User',
-          photoUrl: avatarEndpoint
-        });
-        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({ ok: true }));
-      } catch (e) {
-        res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({ ok: false, error: e.message }));
-      }
-    });
-    return;
-  }
-
-  if (req.method === 'POST' && parsedUrl.pathname === '/api/referral/confirm') {
-    let body = '';
-    req.on('data', chunk => { body += chunk; });
-    req.on('end', () => {
-      try {
-        const payload = JSON.parse(body || '{}');
-        const referrerId = String(payload.referrerId || '').trim();
-        const invitedId = String(payload.invitedId || '').trim();
-        const avatarEndpoint = `${BOT_BASE_URL}/api/avatar?uid=${encodeURIComponent(invitedId)}`;
-        const confirmed = confirmReferralForReferrer(referrerId, invitedId, {
-          username: payload.username || '',
-          firstName: payload.firstName || 'User',
-          photoUrl: avatarEndpoint
-        });
-        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({ ok: confirmed }));
-      } catch (e) {
-        res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({ ok: false, error: e.message }));
-      }
-    });
-    return;
-  }
-
-  if (req.method === 'GET' && parsedUrl.pathname === '/api/user') {
-    const uId = String(parsedUrl.query?.uid || '').trim();
-    const userObj = uId && store.users[uId] ? store.users[uId] : null;
-    if (userObj && Array.isArray(userObj.referralsList)) {
-      userObj.referralsList = userObj.referralsList.map(item => {
-        const inv = store.users[String(item.uid)];
-        const invAvatar = `${BOT_BASE_URL}/api/avatar?uid=${encodeURIComponent(String(item.uid))}`;
-        return {
-          ...item,
-          username: inv?.username || item.username || '',
-          firstName: inv?.firstName || item.firstName || 'User',
-          photoUrl: invAvatar,
-          verified: Boolean(inv?.isVerified || item.verified)
-        };
+    for (let i = 0; i < addCount; i++) {
+      targetUser.referralsList.push({
+        uid: `boost_${targetUid}_${Date.now()}_${i}`,
+        firstName: `Verified Miner #${targetUser.referralsList.length + 1}`,
+        username: "",
+        verified: true,
+        joinedAt: Date.now(),
+        verifiedAt: Date.now(),
+        adminBoosted: true
       });
     }
-    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-    res.end(JSON.stringify({
+
+    targetUser.refCount = targetUser.referralsList.filter((r) => Boolean(r && r.verified)).length;
+    targetUser.updatedAt = Date.now();
+    saveStore();
+    adminStates.delete(senderId);
+
+    return bot.sendMessage(
+      chatId,
+      `✅ <b>تمت إضافة ${addCount} إحالات موثقة بنجاح!</b>\n\n` +
+        `• المستخدم: <code>${targetUid}</code> (${targetUser.username ? "@" + targetUser.username : targetUser.firstName})\n` +
+        `• إجمالي الإحالات الموثقة الآن: <b>${targetUser.refCount}</b>\n\n` +
+        `سيظهر التحديث فوراً في صفحة <b>TOP 20 Referrers</b>.`,
+      {
+        parse_mode: "HTML",
+        reply_markup: getAdminKeyboard()
+      }
+    );
+  }
+
+  if (state.step === "admin_ban") {
+    const u = ensureUserRecord(text);
+    u.banned = true;
+    saveStore();
+    adminStates.delete(senderId);
+    return bot.sendMessage(chatId, `🚫 تم حظر المستخدم <code>${text}</code>.`, {
+      parse_mode: "HTML",
+      reply_markup: getAdminKeyboard()
+    });
+  }
+
+  if (state.step === "admin_unban") {
+    const u = ensureUserRecord(text);
+    u.banned = false;
+    saveStore();
+    adminStates.delete(senderId);
+    return bot.sendMessage(chatId, `✅ تم إلغاء حظر المستخدم <code>${text}</code>.`, {
+      parse_mode: "HTML",
+      reply_markup: getAdminKeyboard()
+    });
+  }
+
+  if (state.step === "admin_add_tester") {
+    store.system.allowedTesters = Array.isArray(store.system.allowedTesters)
+      ? store.system.allowedTesters
+      : [];
+    if (!store.system.allowedTesters.includes(text)) {
+      store.system.allowedTesters.push(text);
+      saveStore();
+    }
+    adminStates.delete(senderId);
+    return bot.sendMessage(chatId, `🧪 تمت إضافة <code>${text}</code> إلى قائمة المختبرين.`, {
+      parse_mode: "HTML",
+      reply_markup: getAdminKeyboard()
+    });
+  }
+
+  if (state.step === "admin_history") {
+    const u = store.users?.[text];
+    adminStates.delete(senderId);
+    if (!u || !Array.isArray(u.history) || !u.history.length) {
+      return bot.sendMessage(chatId, `🗂️ لا يوجد سجل عمليات للمستخدم <code>${text}</code>.`, {
+        parse_mode: "HTML",
+        reply_markup: getAdminKeyboard()
+      });
+    }
+    const recent = u.history
+      .slice(-8)
+      .reverse()
+      .map((h) => `• ${h.source}: <b>${h.amount} ROL</b> (${h.details || ""})`)
+      .join("\n");
+    return bot.sendMessage(chatId, `🗂️ <b>سجل المستخدم <code>${text}</code>:</b>\n\n${recent}`, {
+      parse_mode: "HTML",
+      reply_markup: getAdminKeyboard()
+    });
+  }
+});
+
+app.get("/api/check-channel", async (req, res) => {
+  const userId = req.query.userId;
+  if (!userId) return res.json({ joined: false });
+  try {
+    const member = await bot.getChatMember(REQUIRED_CHANNEL, Number(userId));
+    const joined = ["creator", "administrator", "member", "restricted"].includes(member.status);
+    return res.json({ joined });
+  } catch (err) {
+    return res.json({ joined: false });
+  }
+});
+
+app.get("/api/avatar", async (req, res) => {
+  const uid = String(req.query.uid || "").trim();
+  if (!uid) return res.status(404).end();
+
+  const cached = avatarCache.get(uid);
+  if (cached && Date.now() - cached.ts < 3600000) {
+    res.setHeader("Content-Type", cached.mime || "image/jpeg");
+    return res.send(cached.buffer);
+  }
+
+  try {
+    const photos = await bot.getUserProfilePhotos(Number(uid), { limit: 1 });
+    if (photos && photos.total_count > 0 && photos.photos[0]?.length > 0) {
+      const sizes = photos.photos[0];
+      const bestPhoto = sizes[sizes.length - 1];
+      const fileLink = await bot.getFileLink(bestPhoto.file_id);
+      const response = await fetch(fileLink);
+      if (response.ok) {
+        const arrayBuf = await response.arrayBuffer();
+        const buffer = Buffer.from(arrayBuf);
+        const mime = response.headers.get("content-type") || "image/jpeg";
+        avatarCache.set(uid, { buffer, mime, ts: Date.now() });
+        res.setHeader("Content-Type", mime);
+        return res.send(buffer);
+      }
+    }
+  } catch (e) {}
+
+  return res.status(404).end();
+});
+
+app.get("/api/top-referrals", (req, res) => {
+  const contest = normalizeContestWindow();
+  saveStore();
+  res.json({
+    ok: true,
+    top20: getTop20List(),
+    contest
+  });
+});
+
+app.get("/api/user", (req, res) => {
+  const uid = String(req.query.uid || "").trim();
+  const contest = normalizeContestWindow();
+  if (!uid) {
+    return res.json({
       ok: true,
-      user: userObj,
       system: store.system,
-      contest: getContestState(),
-      appVersion
-    }));
-    return;
-  }
-
-  if (req.method === 'POST' && parsedUrl.pathname === '/api/sync-user') {
-    let body = '';
-    req.on('data', chunk => { body += chunk; });
-    req.on('end', () => {
-      try {
-        const payload = JSON.parse(body || '{}');
-        const uId = String(payload.uid || '').trim();
-        if (!uId || uId === 'guest_miner') {
-          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-          return res.end(JSON.stringify({ ok: true }));
-        }
-        const existing = ensureUserRecord(uId, payload);
-        const avatarEndpoint = `${BOT_BASE_URL}/api/avatar?uid=${encodeURIComponent(uId)}`;
-        store.users[uId] = {
-          ...existing,
-          ...payload,
-          uid: uId,
-          photoUrl: avatarEndpoint,
-          history: Array.isArray(existing.history) ? existing.history : [],
-          referralsList: Array.isArray(existing.referralsList) ? existing.referralsList : [],
-          updatedAt: Date.now()
-        };
-
-        const refBy = store.users[uId].referredBy;
-        if (refBy && refBy !== uId) {
-          registerReferralLink(refBy, uId, {
-            username: store.users[uId].username,
-            firstName: store.users[uId].firstName,
-            photoUrl: store.users[uId].photoUrl
-          });
-          if (store.users[uId].isVerified) {
-            confirmReferralForReferrer(refBy, uId, {
-              username: store.users[uId].username,
-              firstName: store.users[uId].firstName,
-              photoUrl: store.users[uId].photoUrl
-            });
-          }
-        }
-
-        if (payload.historyEntry && typeof payload.historyEntry === 'object') {
-          store.users[uId].history.push({
-            ...payload.historyEntry,
-            timestamp: payload.historyEntry.timestamp || Date.now()
-          });
-          if (store.users[uId].history.length > 100) {
-            store.users[uId].history = store.users[uId].history.slice(-100);
-          }
-        }
-        syncTopLeaderboardPersistent();
-        saveStore();
-        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({ ok: true }));
-      } catch (e) {
-        res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({ ok: false, error: e.message }));
-      }
+      contest
     });
-    return;
+  }
+  const u = store.users?.[uid] || null;
+  if (u) {
+    u.refCount = getVerifiedCountForUser(u);
+  }
+  res.json({
+    ok: true,
+    user: u,
+    system: store.system,
+    contest
+  });
+});
+
+app.post("/api/sync-user", (req, res) => {
+  const body = req.body || {};
+  const uid = String(body.uid || "").trim();
+  if (!uid) return res.status(400).json({ ok: false, error: "Missing uid" });
+
+  const u = ensureUserRecord(uid, {
+    username: body.username || "",
+    firstName: body.firstName || ""
+  });
+
+  if (typeof body.balance === "number" && !Number.isNaN(body.balance)) {
+    u.balance = Number(body.balance);
+  }
+  if (typeof body.vip === "number") u.vip = body.vip;
+  if (typeof body.dailyProfit24h === "number") u.dailyProfit24h = body.dailyProfit24h;
+  if (typeof body.onChainWalletROL === "number") u.onChainWalletROL = body.onChainWalletROL;
+  if (typeof body.wallet === "string") u.wallet = body.wallet;
+  if (typeof body.isVerified === "boolean") u.isVerified = body.isVerified;
+  if (typeof body.verifyProof === "string") u.verifyProof = body.verifyProof;
+  if (typeof body.firstFreeUsed === "boolean") u.firstFreeUsed = body.firstFreeUsed;
+  if (typeof body.spinTickets === "number") u.spinTickets = body.spinTickets;
+  if (typeof body.startTime === "number") u.startTime = body.startTime;
+  if (typeof body.checkinDay === "number") u.checkinDay = body.checkinDay;
+  if (typeof body.lastCheckinTime === "number") u.lastCheckinTime = body.lastCheckinTime;
+  if (Array.isArray(body.completedTasks)) u.completedTasks = body.completedTasks;
+
+  const listVerified = u.referralsList.filter((r) => Boolean(r && r.verified)).length;
+  if (typeof body.refCount === "number") {
+    u.refCount = Math.max(Number(body.refCount), listVerified);
+  } else {
+    u.refCount = listVerified;
   }
 
-  if (req.method === 'POST' && parsedUrl.pathname === '/api/withdraw') {
-    let body = '';
-    req.on('data', chunk => { body += chunk; });
-    req.on('end', () => {
-      try {
-        const wData = JSON.parse(body || '{}');
-        const reqId = String(wData.id || `wd_${Date.now()}`);
-        store.withdrawals[reqId] = {
-          ...wData,
-          id: reqId,
-          status: 'pending',
-          createdAt: wData.createdAt || Date.now()
-        };
-        if (wData.uid) {
-          addUserHistory(wData.uid, 'Withdrawal Request', -Number(wData.amount || 0), `Net: ${wData.netAmount || 0} ROL`, 0);
-        }
-        saveStore();
-        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({ ok: true }));
-      } catch (e) {
-        res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({ ok: false, error: e.message }));
-      }
+  if (typeof body.refEarn === "number") {
+    u.refEarn = Math.max(Number(u.refEarn || 0), Number(body.refEarn));
+  }
+
+  if (body.historyEntry && typeof body.historyEntry === "object") {
+    u.history.push(body.historyEntry);
+    if (u.history.length > 100) {
+      u.history = u.history.slice(-100);
+    }
+  }
+
+  u.updatedAt = Date.now();
+  normalizeContestWindow();
+  saveStore();
+  res.json({ ok: true, user: u });
+});
+
+app.post("/api/referral/track", (req, res) => {
+  const { referrerId, invitedId, username, firstName } = req.body || {};
+  if (!referrerId || !invitedId || String(referrerId) === String(invitedId)) {
+    return res.json({ ok: false });
+  }
+  const refUser = ensureUserRecord(String(referrerId));
+  const invitedKey = String(invitedId);
+  const existingIdx = refUser.referralsList.findIndex((r) => String(r.uid) === invitedKey);
+  if (existingIdx === -1) {
+    refUser.referralsList.push({
+      uid: invitedKey,
+      firstName: firstName || `Miner ${invitedKey}`,
+      username: username || "",
+      verified: false,
+      joinedAt: Date.now()
     });
-    return;
+  } else {
+    if (firstName) refUser.referralsList[existingIdx].firstName = firstName;
+    if (username) refUser.referralsList[existingIdx].username = username;
+  }
+  refUser.refCount = getVerifiedCountForUser(refUser);
+  saveStore();
+  res.json({ ok: true });
+});
+
+app.post("/api/referral/confirm", (req, res) => {
+  const { referrerId, invitedId, username, firstName } = req.body || {};
+  if (!referrerId || !invitedId || String(referrerId) === String(invitedId)) {
+    return res.json({ ok: false });
+  }
+  const refUser = ensureUserRecord(String(referrerId));
+  const invitedKey = String(invitedId);
+  let item = refUser.referralsList.find((r) => String(r.uid) === invitedKey);
+  if (!item) {
+    item = {
+      uid: invitedKey,
+      firstName: firstName || `Miner ${invitedKey}`,
+      username: username || "",
+      verified: false,
+      joinedAt: Date.now()
+    };
+    refUser.referralsList.push(item);
   }
 
-  res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-  res.end('ROL Mining Bot is Live and Active.');
-}).listen(PORT, '0.0.0.0', () => {
+  if (!item.verified) {
+    item.verified = true;
+    item.verifiedAt = Date.now();
+    refUser.balance = Number((Number(refUser.balance || 0) + REFERRAL_BONUS_ROL).toFixed(2));
+    refUser.refEarn = Number((Number(refUser.refEarn || 0) + REFERRAL_BONUS_ROL).toFixed(2));
+    refUser.spinTickets = Number(refUser.spinTickets || 0) + REFERRAL_BONUS_SPINS;
+    refUser.history.push({
+      source: "Verified Referral Bonus",
+      amount: REFERRAL_BONUS_ROL,
+      details: `Invited user ${invitedKey} (+${REFERRAL_BONUS_SPINS} Spin)`,
+      timestamp: Date.now()
+    });
+  }
+
+  refUser.refCount = getVerifiedCountForUser(refUser);
+  saveStore();
+  res.json({ ok: true, refCount: refUser.refCount });
+});
+
+app.get("/api/tasks", (req, res) => {
+  store.tasks = Array.isArray(store.tasks) ? store.tasks : [];
+  const active = store.tasks.filter(
+    (t) => Number(t.completedCount || 0) < Number(t.targetUsers || 0)
+  );
+  res.json({ ok: true, tasks: active });
+});
+
+app.post("/api/tasks", (req, res) => {
+  const task = req.body || {};
+  if (!task.id || !task.url || !task.targetUsers) {
+    return res.status(400).json({ ok: false, error: "Invalid task payload" });
+  }
+  store.tasks = Array.isArray(store.tasks) ? store.tasks : [];
+  const exists = store.tasks.find((t) => t.id === task.id);
+  if (!exists) {
+    const newTask = {
+      id: String(task.id),
+      url: String(task.url),
+      label: String(task.label || task.url),
+      targetUsers: Number(task.targetUsers),
+      completedCount: Number(task.completedCount || 0),
+      rewardRol: Number(task.rewardRol || CUSTOM_TASK_REWARD_ROL),
+      paidGram: Number(task.paidGram || 0),
+      createdBy: String(task.createdBy || ""),
+      createdAt: Number(task.createdAt || Date.now()),
+      completedBy: []
+    };
+    store.tasks.unshift(newTask);
+    saveStore();
+    return res.json({ ok: true, task: newTask });
+  }
+  res.json({ ok: true, task: exists });
+});
+
+app.post("/api/tasks/complete", (req, res) => {
+  const { taskId, uid } = req.body || {};
+  store.tasks = Array.isArray(store.tasks) ? store.tasks : [];
+  const idx = store.tasks.findIndex((t) => t.id === taskId);
+  if (idx === -1) {
+    return res.json({ ok: false, expired: true });
+  }
+  const task = store.tasks[idx];
+  task.completedBy = Array.isArray(task.completedBy) ? task.completedBy : [];
+  if (uid && task.completedBy.includes(String(uid))) {
+    return res.json({ ok: true, alreadyCompleted: true });
+  }
+  if (Number(task.completedCount || 0) >= Number(task.targetUsers || 0)) {
+    return res.json({ ok: false, expired: true });
+  }
+  if (uid) task.completedBy.push(String(uid));
+  task.completedCount = Number(task.completedCount || 0) + 1;
+  saveStore();
+  res.json({ ok: true, rewardRol: Number(task.rewardRol || CUSTOM_TASK_REWARD_ROL) });
+});
+
+app.post("/api/withdraw", (req, res) => {
+  const body = req.body || {};
+  const amount = Number(body.amount || 0);
+  if (!body.uid || !body.address || amount < MIN_WITHDRAW_ROL) {
+    return res.status(400).json({ ok: false, error: "Invalid withdrawal request" });
+  }
+  store.withdrawals = Array.isArray(store.withdrawals) ? store.withdrawals : [];
+  const record = {
+    id: body.id || `wd_${body.uid}_${Date.now()}`,
+    uid: String(body.uid),
+    username: body.username || "",
+    amount: amount,
+    feePercent: 5,
+    feeAmount: Number((amount * 0.05).toFixed(2)),
+    netAmount: Number((amount * 0.95).toFixed(2)),
+    requiredWalletHold: Number((amount * 0.25).toFixed(2)),
+    onChainWalletROL: Number(body.onChainWalletROL || 0),
+    address: String(body.address),
+    network: "TON",
+    status: "pending",
+    createdAt: Date.now()
+  };
+  store.withdrawals.unshift(record);
+  saveStore();
+  res.json({ ok: true, withdrawal: record });
+});
+
+app.get("/", (req, res) => {
+  res.send("ROL Mining Bot Server is running.");
+});
+
+app.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
 });
