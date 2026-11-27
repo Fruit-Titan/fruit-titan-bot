@@ -22,9 +22,15 @@ const DATA_FILE = path.join(__dirname, 'rol_bot_data.json');
 const BACKUP_FILE = path.join(__dirname, 'rol_bot_data.backup.json');
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
 
-const SECRET_PROMO_CODES = {
-  "ROL10K": { rewardRol: 2500, maxClaims: 500 },
-  "ROL2500": { rewardRol: 2500, maxClaims: 500 }
+const DEFAULT_PROMO_CODES = {
+  "ROL10K": {
+    code: "ROL10K",
+    rewardRol: 2500,
+    maxClaims: 500,
+    claimsCount: 0,
+    expiresAt: Date.now() + (7 * 24 * 60 * 60 * 1000),
+    createdAt: Date.now()
+  }
 };
 
 function createDefaultDB() {
@@ -32,7 +38,7 @@ function createDefaultDB() {
     users: {},
     tasks: [],
     withdrawals: [],
-    promoUsage: {},
+    promoCodes: { ...DEFAULT_PROMO_CODES },
     contest: {
       startedAt: Date.now(),
       endsAt: Date.now() + WEEK_MS
@@ -73,7 +79,9 @@ function loadDB() {
         users: parsed.users || {},
         tasks: Array.isArray(parsed.tasks) ? parsed.tasks : [],
         withdrawals: Array.isArray(parsed.withdrawals) ? parsed.withdrawals : [],
-        promoUsage: parsed.promoUsage && typeof parsed.promoUsage === 'object' ? parsed.promoUsage : {},
+        promoCodes: parsed.promoCodes && typeof parsed.promoCodes === 'object'
+          ? { ...DEFAULT_PROMO_CODES, ...parsed.promoCodes }
+          : { ...DEFAULT_PROMO_CODES },
         contest: {
           startedAt: Number(parsed.contest?.startedAt) || Date.now(),
           endsAt: Number(parsed.contest?.endsAt) > Date.now()
@@ -187,7 +195,7 @@ bot.on('polling_error', (err) => {
 
 async function resolveUserPhotoUrl(targetUid) {
   const key = String(targetUid);
-  if (!key || key.startsWith('boost_') || key.startsWith('slot_')) return "";
+  if (!key || key.startsWith('boost_') || key.startsWith('slot_') || key.startsWith('admin_ref_')) return "";
   const cached = avatarCache.get(key);
   if (cached && (Date.now() - cached.ts) < 3600000) {
     return cached.url;
@@ -386,9 +394,14 @@ app.post('/api/promo/redeem', (req, res) => {
       return res.status(400).json({ ok: false, error: 'missing_params' });
     }
 
-    const promoCfg = SECRET_PROMO_CODES[rawCode];
+    db.promoCodes = db.promoCodes || { ...DEFAULT_PROMO_CODES };
+    const promoCfg = db.promoCodes[rawCode];
     if (!promoCfg) {
       return res.status(404).json({ ok: false, error: 'invalid_code' });
+    }
+
+    if (Number(promoCfg.expiresAt || 0) > 0 && Date.now() > Number(promoCfg.expiresAt)) {
+      return res.status(410).json({ ok: false, error: 'expired_code' });
     }
 
     const u = ensureUser(uidStr, req.body?.username || '', req.body?.firstName || 'Miner');
@@ -401,23 +414,24 @@ app.post('/api/promo/redeem', (req, res) => {
       return res.status(409).json({ ok: false, error: 'already_redeemed' });
     }
 
-    db.promoUsage = db.promoUsage || {};
-    const currentClaims = Number(db.promoUsage[rawCode] || 0);
-    if (currentClaims >= promoCfg.maxClaims) {
+    const currentClaims = Number(promoCfg.claimsCount || 0);
+    const maxClaims = Number(promoCfg.maxClaims || 0);
+    if (maxClaims > 0 && currentClaims >= maxClaims) {
       return res.status(410).json({ ok: false, error: 'limit_reached' });
     }
 
-    db.promoUsage[rawCode] = currentClaims + 1;
+    const rewardRol = Number(promoCfg.rewardRol || 0);
+    promoCfg.claimsCount = currentClaims + 1;
     u.redeemedCodes.push(rawCode);
-    u.balance = Number((Number(u.balance || 0) + promoCfg.rewardRol).toFixed(2));
-    appendUserHistory(u, 'Secret Promo Code', promoCfg.rewardRol, `Code ${rawCode}`);
+    u.balance = Number((Number(u.balance || 0) + rewardRol).toFixed(2));
+    appendUserHistory(u, 'Secret Promo Code', rewardRol, `Code ${rawCode}`);
     u.updatedAt = Date.now();
     saveDB();
 
     return res.json({
       ok: true,
       code: rawCode,
-      rewardRol: promoCfg.rewardRol,
+      rewardRol,
       balance: u.balance,
       history: u.history
     });
@@ -626,6 +640,10 @@ function getAdminKeyboard() {
           { text: "📜 سجل مستخدم (History)", callback_data: "admin_user_history" }
         ],
         [
+          { text: "📋 المهام (الحالية والسابقة)", callback_data: "admin_tasks" },
+          { text: "🎟️ إضافة كود ترويجي", callback_data: "admin_add_promo" }
+        ],
+        [
           { text: "🚫 حظر مستخدم", callback_data: "admin_ban" },
           { text: "✅ إلغاء حظر", callback_data: "admin_unban" }
         ],
@@ -635,9 +653,10 @@ function getAdminKeyboard() {
         ],
         [
           { text: "💾 نسخة احتياطية للبيانات", callback_data: "admin_backup" },
-          { text: "➕ إضافة إحالات موثقة", callback_data: "admin_add_refs" }
+          { text: "🔄 تحديث الإحصائيات", callback_data: "admin_refresh_stats" }
         ],
         [
+          { text: "➕ إضافة إحالات موثقة", callback_data: "admin_add_refs" },
           { text: "⚠️ تصفير جميع الأرصدة (Reset)", callback_data: "admin_reset_balances" }
         ]
       ]
@@ -681,17 +700,16 @@ bot.onText(/\/start(.*)/, async (msg, match) => {
 
   await bot.sendMessage(
     chatId,
-    `⛏️ مرحباً بك في <b>ROL Mining</b> على شبكة <b>TON</b>!\n\n` +
-    `💎 رمز العملة: <code>${ROL_JETTON_MASTER}</code>\n` +
-    `📢 القناة الرسمية: ${REQUIRED_CHANNEL_URL}\n` +
-    `🔐 كود ترويجي تجريبي: <code>ROL10K</code> (+2,500 ROL)\n\n` +
-    `اضغط على الزر أدناه لفتح التطبيق المصغر والبدء بالتعدين:`,
+    `⛏️ Welcome to <b>ROL Mining</b> on <b>TON</b>!\n\n` +
+    `💎 ROL Jetton: <code>${ROL_JETTON_MASTER}</code>\n` +
+    `📢 Official Channel: ${REQUIRED_CHANNEL_URL}\n\n` +
+    `Tap below to launch the Mini App and start mining:`,
     {
       parse_mode: 'HTML',
       reply_markup: {
         inline_keyboard: [
-          [{ text: "🚀 فتح تطبيق ROL Mining", web_app: { url: MINI_APP_URL } }],
-          [{ text: "📢 الانضمام إلى القناة @ROL_TOKN", url: REQUIRED_CHANNEL_URL }]
+          [{ text: "🚀 Launch ROL Mining", web_app: { url: MINI_APP_URL } }],
+          [{ text: "📢 Join @ROL_TOKN", url: REQUIRED_CHANNEL_URL }]
         ]
       }
     }
@@ -722,7 +740,7 @@ bot.on('callback_query', async (query) => {
 
   await bot.answerCallbackQuery(query.id);
 
-  if (data === 'admin_stats') {
+  if (data === 'admin_stats' || data === 'admin_refresh_stats') {
     const usersArr = Object.values(db.users || {});
     const verifiedCount = usersArr.filter(x => x.isVerified).length;
     const totalBal = usersArr.reduce((acc, x) => acc + Number(x.balance || 0), 0);
@@ -734,6 +752,30 @@ bot.on('callback_query', async (query) => {
       `💰 مجموع أرصدة البوت: <b>${totalBal.toLocaleString('en-US')} ROL</b>\n` +
       `⏳ طلبات السحب المعلقة: <b>${(db.withdrawals || []).filter(w => w.status === 'pending').length}</b>`,
       { parse_mode: 'HTML', ...getAdminKeyboard() }
+    );
+  }
+
+  if (data === 'admin_tasks') {
+    const allTasks = db.tasks || [];
+    const lines = allTasks.slice(0, 15).map((t, i) =>
+      `${i + 1}. <b>${t.label}</b> — ${Number(t.completedCount || 0)}/${Number(t.targetUsers || 0)}`
+    );
+    return bot.sendMessage(
+      chatId,
+      `📋 <b>المهام (${allTasks.length})</b>\n\n${lines.join('\n') || 'لا توجد مهام مضافة حالياً'}`,
+      { parse_mode: 'HTML', ...getAdminKeyboard() }
+    );
+  }
+
+  if (data === 'admin_add_promo') {
+    adminPendingAction.set(senderId, 'add_promo');
+    return bot.sendMessage(
+      chatId,
+      `🎟️ أرسل بيانات الكود الترويجي بهذا الشكل:\n` +
+      `<code>الكود النقاط عدد_المستخدمين مدة_الصلاحية_بالساعات</code>\n\n` +
+      `مثال:\n<code>ROLBOOST 2500 500 48</code>\n` +
+      `(يعني كود ROLBOOST يمنح 2500 نقطة لأول 500 مستخدم وصالح لمدة 48 ساعة)`,
+      { parse_mode: 'HTML' }
     );
   }
 
@@ -866,6 +908,44 @@ bot.on('message', async (msg) => {
   const pendingType = adminPendingAction.get(senderId);
   if (!pendingType) return;
   adminPendingAction.delete(senderId);
+
+  if (pendingType === 'add_promo') {
+    const parts = text.split(/\s+/);
+    const codeStr = String(parts[0] || '').trim().toUpperCase();
+    const rewardNum = parseFloat(parts[1] || '0');
+    const maxUsersNum = parseInt(parts[2] || '0', 10);
+    const hoursNum = parseFloat(parts[3] || '0');
+
+    if (!codeStr || isNaN(rewardNum) || rewardNum <= 0 || isNaN(maxUsersNum) || maxUsersNum <= 0 || isNaN(hoursNum) || hoursNum <= 0) {
+      return bot.sendMessage(
+        chatId,
+        "⚠️ صيغة غير صحيحة. أرسل:\n<code>الكود النقاط عدد_المستخدمين مدة_الصلاحية_بالساعات</code>\nمثال: <code>ROLBOOST 2500 500 48</code>",
+        { parse_mode: 'HTML', ...getAdminKeyboard() }
+      );
+    }
+
+    const expiresAt = Date.now() + (hoursNum * 60 * 60 * 1000);
+    db.promoCodes = db.promoCodes || {};
+    db.promoCodes[codeStr] = {
+      code: codeStr,
+      rewardRol: Number(rewardNum.toFixed(2)),
+      maxClaims: maxUsersNum,
+      claimsCount: 0,
+      expiresAt,
+      createdAt: Date.now()
+    };
+    saveDB();
+
+    return bot.sendMessage(
+      chatId,
+      `✅ تم إنشاء الكود الترويجي بنجاح!\n\n` +
+      `🎟️ الكود: <code>${codeStr}</code>\n` +
+      `💰 المكافأة: <b>+${Number(rewardNum.toFixed(2)).toLocaleString('en-US')} ROL</b>\n` +
+      `👥 الحد الأقصى للمستخدمين: <b>${maxUsersNum}</b>\n` +
+      `⏳ مدة الصلاحية: <b>${hoursNum} ساعة</b>`,
+      { parse_mode: 'HTML', ...getAdminKeyboard() }
+    );
+  }
 
   if (pendingType === 'history') {
     const target = db.users[text];
